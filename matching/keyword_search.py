@@ -7,8 +7,73 @@ from typing import List, Dict
 import re
 
 
+# Porter-style suffix rules for lightweight stemming (no external dependency)
+_STEP2_SUFFIXES = [
+    ("ational", "ate"), ("tional", "tion"), ("enci", "ence"), ("anci", "ance"),
+    ("izer", "ize"), ("iser", "ise"), ("abli", "able"), ("alli", "al"),
+    ("entli", "ent"), ("eli", "e"), ("ousli", "ous"), ("ization", "ize"),
+    ("isation", "ise"), ("ation", "ate"), ("ator", "ate"), ("alism", "al"),
+    ("iveness", "ive"), ("fulness", "ful"), ("ousness", "ous"), ("aliti", "al"),
+    ("iviti", "ive"), ("biliti", "ble"),
+]
+
+STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "am", "are", "was", "were", "be",
+    "been", "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "shall", "should", "may", "might", "must", "can", "could",
+    "not", "no", "nor", "so", "if", "then", "than", "that", "this",
+    "these", "those", "it", "its", "i", "me", "my", "we", "our", "you",
+    "your", "he", "him", "his", "she", "her", "they", "them", "their",
+    "what", "which", "who", "whom", "when", "where", "how", "why",
+    "all", "each", "every", "both", "few", "more", "most", "other",
+    "some", "such", "only", "own", "same", "also", "just", "about",
+    "above", "after", "again", "any", "because", "before", "below",
+    "between", "during", "into", "out", "over", "through", "under",
+    "until", "up", "very", "too", "here", "there",
+})
+
+
+def _simple_stem(word: str) -> str:
+    """Lightweight English stemmer — handles common suffixes without nltk."""
+    if len(word) <= 3:
+        return word
+
+    # Step 1: plural / past-tense
+    if word.endswith("ies") and len(word) > 4:
+        word = word[:-3] + "i"
+    elif word.endswith("sses"):
+        word = word[:-2]
+    elif word.endswith("ss"):
+        pass
+    elif word.endswith("s") and not word.endswith("us") and not word.endswith("ss"):
+        word = word[:-1]
+
+    if word.endswith("eed"):
+        if len(word) > 4:
+            word = word[:-1]
+    elif word.endswith("ed") and len(word) > 4:
+        word = word[:-2]
+    elif word.endswith("ing") and len(word) > 5:
+        word = word[:-3]
+
+    # Step 2: derivational suffixes
+    for suffix, replacement in _STEP2_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) > 1:
+            word = word[: -len(suffix)] + replacement
+            break
+
+    # Step 3: common trailing patterns
+    for suffix in ("ful", "ness", "ment", "ous", "ive", "ize", "ise", "ent", "ant", "ible", "able"):
+        if word.endswith(suffix) and len(word) - len(suffix) > 2:
+            word = word[: -len(suffix)]
+            break
+
+    return word
+
+
 class KeywordSearcher:
-    """BM25-based keyword search"""
+    """BM25-based keyword search with stopword removal and stemming"""
     
     def __init__(self):
         self.bm25 = None
@@ -73,21 +138,17 @@ class KeywordSearcher:
     
     def _tokenize(self, text: str) -> List[str]:
         """
-        Tokenize text for BM25
+        Tokenize text for BM25 with stopword removal and stemming.
         
         Args:
             text: Text to tokenize
             
         Returns:
-            List of tokens
+            List of stemmed, filtered tokens
         """
-        # Convert to lowercase
         text = text.lower()
-        
-        # Split on non-alphanumeric characters
-        tokens = re.findall(r'\b\w+\b', text)
-        
-        return tokens
+        raw_tokens = re.findall(r'\b\w+\b', text)
+        return [_simple_stem(t) for t in raw_tokens if t not in STOPWORDS and len(t) > 1]
     
     def get_statistics(self) -> Dict:
         """Get indexing statistics"""

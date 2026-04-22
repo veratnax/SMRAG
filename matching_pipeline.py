@@ -3,11 +3,16 @@ Main Matching Pipeline
 Orchestrates the entire matching workflow
 """
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from openai import OpenAI
 from processors import PDFProcessor, ExcelProcessor, Embedder, IntelligentChunker
 from matching import KeywordSearcher, HybridMatcher, LLMReranker
 from utils.vector_store import VectorStore
 from qa.qa_learner import QALearner
-from config import DEFAULT_TOP_N, GUIDANCE_EMBEDDING_WEIGHT
+from config import (DEFAULT_TOP_N, GUIDANCE_EMBEDDING_WEIGHT, RETRIEVAL_POOL_SIZE,
+                     LLM_MODEL, QUERY_EXPANSION_MAX_WORDS, QUERY_EXPANSION_CODE_PATTERN)
+import json
+import re
 
 
 class MatchingPipeline:
@@ -21,6 +26,7 @@ class MatchingPipeline:
             api_key: OpenAI API key
         """
         self.api_key = api_key
+        self.llm_client = OpenAI(api_key=api_key)
         self.embedder = Embedder(api_key)
         self.vector_store = VectorStore()
         self.keyword_searcher = KeywordSearcher()
@@ -32,6 +38,7 @@ class MatchingPipeline:
         self.knowledge_base = []
         self.use_case = None
         self.chunking_strategy = None
+        self._expanded_queries_cache: Dict[str, List[str]] = {}
     
     def setup_pdf_knowledge_base(self, pdf_path: str, use_intelligent_chunking: bool = True,
                                  user_context: Optional[str] = None,
@@ -159,9 +166,20 @@ class MatchingPipeline:
         
         return stats
     
+    @staticmethod
+    def _needs_expansion(query: str) -> bool:
+        """Return True if a query is short/vague enough to benefit from LLM expansion."""
+        word_count = len(query.split())
+        if word_count > QUERY_EXPANSION_MAX_WORDS:
+            return False
+        if re.search(QUERY_EXPANSION_CODE_PATTERN, query):
+            return False
+        return True
+
     def process_queries(self, query_excel_path: str, query_column: str,
                        top_n: int = DEFAULT_TOP_N,
                        use_llm_reranking: bool = True,
+                       use_query_expansion: bool = True,
                        query_offset: int = 0,
                        query_limit: Optional[int] = None,
                        matching_guidance: Optional[str] = None) -> List[Dict]:
@@ -173,6 +191,7 @@ class MatchingPipeline:
             query_column: Query column name
             top_n: Number of matches per query
             use_llm_reranking: Whether to use LLM re-ranking
+            use_query_expansion: Whether to expand short/vague queries for better keyword recall
             query_offset: Starting index for queries (for staged processing)
             query_limit: Maximum number of queries to process (None = all)
             matching_guidance: Optional prompt describing how matching should be evaluated
@@ -221,14 +240,20 @@ class MatchingPipeline:
         print(f"Batch-embedding {len(query_only_texts)} queries...")
         all_query_embeddings = self.embedder.embed_batch(query_only_texts)
 
+        # Query expansion: expand all queries when enabled
+        if use_query_expansion:
+            print(f"Query expansion: expanding all {len(query_only_texts)} queries…")
+            self._expand_queries_batch(query_only_texts)
+        else:
+            print("Query expansion: disabled by user")
+
+        # --- Phase 1: retrieval + hybrid fusion (CPU-bound, fast) -----------
+        retrieval_k = max(RETRIEVAL_POOL_SIZE, top_n * 2)
+        hybrid_per_query: List[Dict] = []  # index-aligned with queries
+
         for i, query_item in enumerate(queries):
             query = query_item["query"]
-
-            if (i + 1) % 10 == 0:
-                print(f"  Processed {i + 1}/{len(queries)} queries...")
-
             try:
-                # Use combined (guidance + query) or query-only embedding for semantic search
                 raw_embedding = all_query_embeddings[i] if i < len(all_query_embeddings) else None
                 if raw_embedding is None:
                     raise Exception("Query embedding failed (empty or API error).")
@@ -239,54 +264,148 @@ class MatchingPipeline:
                 else:
                     query_embedding = raw_embedding
 
-                # Semantic search
-                semantic_results = self.vector_store.search(query_embedding, top_k=top_n * 2)
+                semantic_results = self.vector_store.search(query_embedding, top_k=retrieval_k)
 
-                # Keyword search
-                keyword_results = self.keyword_searcher.search(query, top_k=top_n * 2)
+                expanded_variants = self._expanded_queries_cache.get(query, [query])
+                keyword_results = []
+                seen_keyword_ids = set()
+                for variant in expanded_variants:
+                    for result in self.keyword_searcher.search(variant, top_k=retrieval_k):
+                        doc = result['document']
+                        doc_id = doc.get('chunk_id') or doc.get('entry_id')
+                        if doc_id and doc_id not in seen_keyword_ids:
+                            seen_keyword_ids.add(doc_id)
+                            keyword_results.append(result)
+                keyword_results.sort(key=lambda r: r['bm25_score'], reverse=True)
+                keyword_results = keyword_results[:retrieval_k]
 
-                # Hybrid matching
                 hybrid_results = self.hybrid_matcher.combine_results(
-                    semantic_results, keyword_results, top_k=top_n * 2
+                    semantic_results, keyword_results, top_k=retrieval_k
                 )
+                hybrid_per_query.append({"ok": True, "hybrid": hybrid_results})
+            except Exception as e:
+                hybrid_per_query.append({"ok": False, "error": str(e)})
 
-                # LLM re-ranking (optional) — still receives full matching_guidance for ranking
-                if use_llm_reranking and len(hybrid_results) > 0:
+        print(f"  Retrieval done for {len(queries)} queries. Starting reranking…")
+
+        # --- Phase 2: LLM reranking (I/O-bound) — parallelized ------------
+        MAX_RERANK_WORKERS = 10
+
+        def _rerank_one(idx: int):
+            """Rerank a single query's hybrid results (runs in thread)."""
+            query_item = queries[idx]
+            query = query_item["query"]
+            entry = hybrid_per_query[idx]
+
+            if not entry["ok"]:
+                return idx, {
+                    "query_id": query_item["query_id"],
+                    "query": query,
+                    "row_number": query_item["row_number"],
+                    "matches": [], "num_matches": 0,
+                    "error": entry["error"],
+                }
+
+            hybrid_results = entry["hybrid"]
+            try:
+                if use_llm_reranking and hybrid_results:
                     final_results = self.llm_reranker.rerank(
-                        query,
-                        hybrid_results,
-                        top_k=top_n,
+                        query, hybrid_results, top_k=top_n,
                         use_case=self.use_case,
-                        matching_guidance=matching_guidance
+                        matching_guidance=matching_guidance,
                     )
                 else:
                     final_results = hybrid_results[:top_n]
 
-                # Format matches
                 matches = self._format_matches(final_results)
-
-                results.append({
+                return idx, {
                     "query_id": query_item["query_id"],
                     "query": query,
                     "row_number": query_item["row_number"],
                     "matches": matches,
                     "num_matches": len(matches),
-                })
-
+                }
             except Exception as e:
-                print(f"Error processing query '{query}': {str(e)}")
-                results.append({
+                print(f"Error reranking query '{query}': {e}")
+                return idx, {
                     "query_id": query_item["query_id"],
                     "query": query,
                     "row_number": query_item["row_number"],
-                    "matches": [],
-                    "num_matches": 0,
+                    "matches": [], "num_matches": 0,
                     "error": str(e),
-                })
-        
+                }
+
+        results_by_idx: Dict[int, Dict] = {}
+        done_count = 0
+
+        with ThreadPoolExecutor(max_workers=MAX_RERANK_WORKERS) as pool:
+            futures = {pool.submit(_rerank_one, i): i for i in range(len(queries))}
+            for future in as_completed(futures):
+                idx, result = future.result()
+                results_by_idx[idx] = result
+                done_count += 1
+                if done_count % 10 == 0:
+                    print(f"  Reranked {done_count}/{len(queries)} queries…")
+
+        results = [results_by_idx[i] for i in range(len(queries))]
         print("Query processing complete!")
         return results
     
+    def _expand_queries_batch(self, queries: List[str], batch_size: int = 25) -> Dict[str, List[str]]:
+        """
+        Use the LLM to generate 2-3 reformulations per query for broader
+        keyword search coverage.  Results are cached so repeated calls
+        for the same query text are free.
+
+        Returns a dict mapping original query text -> list of expanded variants
+        (always includes the original as the first element).
+        """
+        uncached = [q for q in queries if q not in self._expanded_queries_cache]
+        if not uncached:
+            return self._expanded_queries_cache
+
+        for start in range(0, len(uncached), batch_size):
+            batch = uncached[start : start + batch_size]
+            numbered = "\n".join(f"{i+1}. {q}" for i, q in enumerate(batch))
+
+            prompt = (
+                "You are a search query expansion assistant. For each numbered query below, "
+                "generate 2-3 alternative phrasings that use synonyms, expanded abbreviations, "
+                "and more descriptive wording. Keep each variant concise (under 15 words).\n\n"
+                f"Queries:\n{numbered}\n\n"
+                "Return a JSON object where keys are the query numbers (as strings) and values "
+                "are arrays of alternative phrasings. Do NOT include the original query in the alternatives.\n"
+                'Example: {"1": ["alt phrasing A", "alt phrasing B"], "2": ["alt C", "alt D", "alt E"]}'
+            )
+
+            try:
+                response = self.llm_client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You expand search queries to improve recall. Return valid JSON only."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                )
+                expansions = json.loads(response.choices[0].message.content)
+
+                for i, original in enumerate(batch):
+                    variants = expansions.get(str(i + 1), [])
+                    if isinstance(variants, list):
+                        self._expanded_queries_cache[original] = [original] + [
+                            v for v in variants if isinstance(v, str) and v.strip()
+                        ]
+                    else:
+                        self._expanded_queries_cache[original] = [original]
+
+            except Exception as e:
+                print(f"Query expansion batch failed ({e}); using original queries.")
+                for original in batch:
+                    self._expanded_queries_cache[original] = [original]
+
+        return self._expanded_queries_cache
+
     def _format_matches(self, results: List[Dict]) -> List[Dict]:
         """Format match results for output"""
         matches = []

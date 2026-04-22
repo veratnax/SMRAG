@@ -129,9 +129,10 @@ class Embedder:
             return []
         
         try:
+            safe_texts = [t.encode('utf-8', errors='replace').decode('utf-8') for t in batch_texts]
             response = self.client.embeddings.create(
                 model=self.model,
-                input=batch_texts
+                input=safe_texts
             )
             return [item.embedding for item in response.data]
         except Exception as e:
