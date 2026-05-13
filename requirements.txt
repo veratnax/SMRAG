@@ -8,6 +8,7 @@ pymupdf>=1.25.0
 chromadb>=0.4.22
 pydantic-settings>=2.0
 openai>=1.12.0
+litellm>=1.55.0
 rank-bm25>=0.2.2
 numpy>=1.26.3
 sentence-transformers>=2.3.1

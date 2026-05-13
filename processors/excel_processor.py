@@ -5,6 +5,19 @@ Handles Excel/CSV parsing for both knowledge base and queries
 import pandas as pd
 from typing import List, Dict, Optional
 
+INVALID_TAG_VALUES = {
+    "not mentioned",
+    "not confirmed",
+    "not available",
+    "unknown",
+    "none",
+    "null",
+    "na",
+    "n/a",
+    "-",
+    "",
+}
+
 
 class ExcelProcessor:
     """Process Excel files for knowledge base and queries"""
@@ -91,35 +104,66 @@ class ExcelProcessor:
         
         return entries
     
-    def process_queries(self, query_column: str) -> List[Dict]:
+    def process_queries(
+        self,
+        query_column: str,
+        primary_key_column: Optional[str] = None,
+        tag_column: Optional[str] = None,
+        tag_separator: Optional[str] = None,
+    ) -> List[Dict]:
         """
         Process Excel as query list
-        
+
         Args:
             query_column: Column containing queries
-            
+            primary_key_column: Optional column (e.g. complaint ID) to attach to each query row
+            tag_column: Optional column containing row-specific tags
+            tag_separator: Optional separator used to split tags in ``tag_column``
+
         Returns:
             List of queries with metadata
         """
         if self.data is None:
             raise Exception("No data loaded. Call load_excel first.")
-        
+
+        pk_col = (
+            primary_key_column
+            if primary_key_column and primary_key_column in self.data.columns
+            else None
+        )
+        tag_col = (
+            tag_column
+            if tag_column and tag_separator and tag_column in self.data.columns
+            else None
+        )
+
         queries = []
-        
+
         for idx, row in self.data.iterrows():
             # Skip rows with missing query
             if pd.isna(row[query_column]):
                 continue
-            
+
             query_text = str(row[query_column]).strip()
-            
+
             if query_text:  # Only add non-empty queries
-                queries.append({
-                    'query': query_text,
-                    'query_id': f"query_{idx}",
-                    'row_number': idx + 2  # +2 for Excel row numbering
-                })
-        
+                item = {
+                    "query": query_text,
+                    "query_id": f"query_{idx}",
+                    "row_number": idx + 2,  # +2 for Excel row numbering
+                }
+                if pk_col is not None and not pd.isna(row[pk_col]):
+                    item["primary_key"] = str(row[pk_col]).strip()
+                if tag_col is not None:
+                    raw = "" if pd.isna(row[tag_col]) else str(row[tag_col]).strip()
+                    raw_l = raw.lower()
+                    if raw_l in INVALID_TAG_VALUES:
+                        item["query_tags"] = []
+                    else:
+                        tags = [t.strip() for t in raw.split(tag_separator) if t.strip()]
+                        item["query_tags"] = tags
+                queries.append(item)
+
         return queries
     
     def get_statistics(self) -> Dict:

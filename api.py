@@ -18,7 +18,7 @@ import uuid
 import json
 import threading
 import traceback
-from typing import Optional, List
+from typing import Optional, List, Literal
 from datetime import datetime
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -32,7 +32,10 @@ from processors import ExcelProcessor
 from utils.export import ResultExporter
 from qa.feedback_store import QAFeedbackStore
 from qa.qa_learner import QALearner
-from config import QA_SAMPLE_SIZE, MAX_TOP_N, DEFAULT_TOP_N
+from config import QA_SAMPLE_SIZE, MAX_TOP_N, DEFAULT_TOP_N, LLM_MODEL
+from utils.llm_router import validate_keys_for_model
+from utils.cost_estimate import count_queries_slice, build_cost_estimate
+from utils.llm_pricing import QUERY_LLM_MODELS
 
 os.makedirs("./data", exist_ok=True)
 os.makedirs("./data/exports", exist_ok=True)
@@ -47,6 +50,7 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://127.0.0.1:8000",
     ],
+    allow_origin_regex=r"https://.*\.ngrok(-free)?\.app",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -80,7 +84,7 @@ def _run_job(job_id: str, fn, *args, **kwargs):
             jobs[job_id]["status"] = "error"
             traceback.print_exc()
 
-    jobs[job_id] = {"status": "pending", "result": None, "error": None}
+    jobs[job_id] = {"status": "pending", "result": None, "error": None, "progress": None}
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
@@ -89,6 +93,8 @@ def _run_job(job_id: str, fn, *args, **kwargs):
 
 class SessionCreate(BaseModel):
     api_key: str
+    anthropic_api_key: Optional[str] = None
+    google_api_key: Optional[str] = None
 
 class SetupPDFRequest(BaseModel):
     session_id: str
@@ -114,6 +120,28 @@ class ProcessQueriesRequest(BaseModel):
     query_offset: int = 0
     query_limit: Optional[int] = None
     matching_guidance: Optional[str] = None
+    primary_key_column: Optional[str] = None
+    llm_model: str = LLM_MODEL
+    match_count_mode: Literal["fixed", "auto", "tag_driven"] = "fixed"
+    min_llm_score: float = 0.70
+    min_combined_score: float = 0.0
+    relative_ratio: float = 0.75
+    gap_stop_delta: float = 0.12
+    tag_column: Optional[str] = None
+    tag_separator: Optional[str] = None
+
+class EstimateCostRequest(BaseModel):
+    session_id: str
+    file_path: str
+    query_column: str
+    primary_key_column: Optional[str] = None
+    query_offset: int = 0
+    query_limit: Optional[int] = None
+    top_n: int = DEFAULT_TOP_N
+    use_llm_reranking: bool = True
+    use_query_expansion: bool = True
+    matching_guidance: Optional[str] = None
+    llm_model: str = LLM_MODEL
 
 class QAFeedbackItem(BaseModel):
     session_id: str
@@ -125,10 +153,17 @@ class QAFeedbackItem(BaseModel):
     match_text: str
     status: str
     notes: Optional[str] = None
+    primary_key: Optional[str] = None
+    tag_index: Optional[int] = None
+    tag_value: Optional[str] = None
 
 class ApplyLearningsRequest(BaseModel):
     session_id: str
     qa_session_id: str
+
+
+# Match-count modes this backend build supports (frontend uses this to avoid 422 vs older servers).
+MATCH_COUNT_MODES: List[str] = ["fixed", "auto", "tag_driven"]
 
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -139,6 +174,9 @@ def get_config():
         "qa_sample_size": QA_SAMPLE_SIZE,
         "max_top_n": MAX_TOP_N,
         "default_top_n": DEFAULT_TOP_N,
+        "query_llm_models": QUERY_LLM_MODELS,
+        "default_query_llm": LLM_MODEL,
+        "match_count_modes": MATCH_COUNT_MODES,
     }
 
 
@@ -154,6 +192,7 @@ def get_job_status(job_id: str):
         "status": job["status"],
         "result": job["result"],
         "error": job["error"],
+        "progress": job.get("progress"),
     }
 
 
@@ -162,13 +201,55 @@ def get_job_status(job_id: str):
 @app.post("/api/session")
 def create_session(body: SessionCreate):
     sid = str(uuid.uuid4())
+    anth = (body.anthropic_api_key or "").strip()
+    ggl = (body.google_api_key or "").strip()
     sessions[sid] = {
-        "pipeline": MatchingPipeline(body.api_key),
+        "openai_api_key": body.api_key.strip(),
+        "anthropic_api_key": anth,
+        "google_api_key": ggl,
+        "pipeline": MatchingPipeline(
+            body.api_key.strip(),
+            anthropic_api_key=anth or None,
+            google_api_key=ggl or None,
+        ),
         "results": [],
         "qa_session_id": None,
         "use_case": None,
     }
     return {"session_id": sid}
+
+
+@app.post("/api/estimate-cost")
+def estimate_cost(body: EstimateCostRequest):
+    sess = _get_session(body.session_id)
+    try:
+        validate_keys_for_model(
+            body.llm_model,
+            sess.get("openai_api_key"),
+            sess.get("anthropic_api_key"),
+            sess.get("google_api_key"),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    use_case = sess.get("use_case") or "excel_kb"
+    n, texts = count_queries_slice(
+        body.file_path,
+        body.query_column,
+        body.primary_key_column,
+        body.query_offset,
+        body.query_limit,
+    )
+    est = build_cost_estimate(
+        num_queries=n,
+        query_texts=texts,
+        use_case=use_case,
+        top_n=body.top_n,
+        use_llm_reranking=body.use_llm_reranking,
+        use_query_expansion=body.use_query_expansion,
+        matching_guidance=body.matching_guidance or "",
+        llm_model=body.llm_model,
+    )
+    return est
 
 
 @app.get("/api/session-state/{session_id}")
@@ -179,7 +260,7 @@ def get_session_state(session_id: str):
     sess = sessions[session_id]
     pipeline: MatchingPipeline = sess["pipeline"]
 
-    kb_ready = pipeline.semantic_search is not None
+    kb_ready = getattr(pipeline, 'semantic_search', None) is not None
     results = sess.get("results", [])
     safe_results = []
     for r in results:
@@ -281,9 +362,19 @@ def setup_excel(body: SetupExcelRequest):
 
 def _do_process_queries(session_id, file_path, query_column, top_n,
                         use_llm_reranking, use_query_expansion,
-                        query_offset, query_limit, matching_guidance):
+                        query_offset, query_limit, matching_guidance,
+                        primary_key_column, job_id, llm_model,
+                        match_count_mode, min_llm_score, min_combined_score,
+                        relative_ratio, gap_stop_delta,
+                        tag_column, tag_separator):
     sess = sessions[session_id]
     pipeline = sess["pipeline"]
+
+    def _progress(stage: str, done: int, total: int) -> None:
+        j = jobs.get(job_id)
+        if j is not None:
+            j["progress"] = {"stage": stage, "done": done, "total": total}
+
     results = pipeline.process_queries(
         file_path, query_column,
         top_n=top_n,
@@ -292,7 +383,20 @@ def _do_process_queries(session_id, file_path, query_column, top_n,
         query_offset=query_offset,
         query_limit=query_limit,
         matching_guidance=matching_guidance,
+        primary_key_column=primary_key_column,
+        progress_callback=_progress,
+        llm_model=llm_model,
+        match_count_mode=match_count_mode,
+        min_llm_score=min_llm_score,
+        min_combined_score=min_combined_score,
+        relative_ratio=relative_ratio,
+        gap_stop_delta=gap_stop_delta,
+        tag_column=tag_column,
+        tag_separator=tag_separator,
     )
+    if job_id in jobs:
+        nr = len(results)
+        jobs[job_id]["progress"] = {"stage": "done", "done": nr, "total": nr}
     sess["results"] = sess.get("results", []) + results
     return {"count": len(results), "results": results}
 
@@ -307,12 +411,31 @@ def clear_results(session_id: str):
 
 @app.post("/api/process-queries")
 def process_queries(body: ProcessQueriesRequest):
-    _get_session(body.session_id)
+    sess = _get_session(body.session_id)
+    try:
+        validate_keys_for_model(
+            body.llm_model,
+            sess.get("openai_api_key"),
+            sess.get("anthropic_api_key"),
+            sess.get("google_api_key"),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if body.match_count_mode == "tag_driven":
+        if not (body.tag_column or "").strip():
+            raise HTTPException(400, "Tag column is required for tag-driven mode.")
+        if not (body.tag_separator or ""):
+            raise HTTPException(400, "Tag separator is required for tag-driven mode.")
     job_id = str(uuid.uuid4())
     _run_job(job_id, _do_process_queries,
              body.session_id, body.file_path, body.query_column,
              body.top_n, body.use_llm_reranking, body.use_query_expansion,
-             body.query_offset, body.query_limit, body.matching_guidance)
+             body.query_offset, body.query_limit, body.matching_guidance,
+             body.primary_key_column, job_id, body.llm_model,
+             body.match_count_mode, body.min_llm_score,
+             body.min_combined_score, body.relative_ratio,
+             body.gap_stop_delta,
+             body.tag_column, body.tag_separator)
     return {"job_id": job_id}
 
 
@@ -334,7 +457,8 @@ def save_feedback(body: QAFeedbackItem):
     store.add_feedback(
         body.qa_session_id, body.query_id, body.query,
         body.match_rank, body.match_id, body.match_text,
-        body.status, notes=body.notes,
+        body.status, notes=body.notes, primary_key_value=body.primary_key,
+        tag_index=body.tag_index, tag_value=body.tag_value,
     )
     return {"status": "ok"}
 

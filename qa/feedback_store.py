@@ -52,7 +52,16 @@ class QAFeedbackStore:
                 updated_at TEXT NOT NULL
             )
         """)
-        
+
+        cursor.execute("PRAGMA table_info(qa_feedback)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        if "primary_key_value" not in existing_cols:
+            cursor.execute("ALTER TABLE qa_feedback ADD COLUMN primary_key_value TEXT")
+        if "tag_index" not in existing_cols:
+            cursor.execute("ALTER TABLE qa_feedback ADD COLUMN tag_index INTEGER")
+        if "tag_value" not in existing_cols:
+            cursor.execute("ALTER TABLE qa_feedback ADD COLUMN tag_value TEXT")
+
         conn.commit()
         conn.close()
     
@@ -80,7 +89,10 @@ class QAFeedbackStore:
     
     def add_feedback(self, session_id: str, query_id: str, query: str,
                     match_rank: int, match_id: str, match_text: str,
-                    status: str, notes: Optional[str] = None) -> None:
+                    status: str, notes: Optional[str] = None,
+                    primary_key_value: Optional[str] = None,
+                    tag_index: Optional[int] = None,
+                    tag_value: Optional[str] = None) -> None:
         """
         Add QA feedback for a match
         
@@ -110,17 +122,20 @@ class QAFeedbackStore:
         if existing:
             # Update existing feedback
             cursor.execute("""
-                UPDATE qa_feedback 
-                SET status = ?, notes = ?, timestamp = ?
+                UPDATE qa_feedback
+                SET status = ?, notes = ?, timestamp = ?,
+                    primary_key_value = COALESCE(?, primary_key_value),
+                    tag_index = COALESCE(?, tag_index),
+                    tag_value = COALESCE(?, tag_value)
                 WHERE id = ?
-            """, (status, notes, timestamp, existing[0]))
+            """, (status, notes, timestamp, primary_key_value, tag_index, tag_value, existing[0]))
         else:
             # Insert new feedback
             cursor.execute("""
-                INSERT INTO qa_feedback 
-                (session_id, query_id, query, match_rank, match_id, match_text, status, notes, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (session_id, query_id, query, match_rank, match_id, match_text, status, notes, timestamp))
+                INSERT INTO qa_feedback
+                (session_id, query_id, query, match_rank, match_id, match_text, status, notes, timestamp, primary_key_value, tag_index, tag_value)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (session_id, query_id, query, match_rank, match_id, match_text, status, notes, timestamp, primary_key_value, tag_index, tag_value))
         
         conn.commit()
         conn.close()

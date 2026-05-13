@@ -29,7 +29,13 @@ export LC_ALL=en_US.UTF-8
 
 echo "Starting FastAPI backend on http://localhost:8000 …"
 echo "  Backend log: $LOG_DIR/backend.log"
-nohup uvicorn api:app --host 0.0.0.0 --port 8000 > "$LOG_DIR/backend.log" 2>&1 &
+UVICORN_BIN="$SCRIPT_DIR/.venv/bin/uvicorn"
+if [ ! -x "$UVICORN_BIN" ]; then
+    echo "Error: $UVICORN_BIN not found or not executable."
+    echo "Create the virtualenv and install requirements first."
+    exit 1
+fi
+nohup "$UVICORN_BIN" api:app --host 0.0.0.0 --port 8000 > "$LOG_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 
 echo "Starting React frontend on http://localhost:5173 …"

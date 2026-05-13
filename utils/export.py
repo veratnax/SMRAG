@@ -40,11 +40,13 @@ class ResultExporter:
         for result in results:
             query = result['query']
             query_row = result.get('row_number', 'N/A')
-            
+            q_pk = result.get('primary_key', '') or ''
+
             if result.get('error'):
                 # Add error row
                 rows.append({
                     'Query_Row': query_row,
+                    'Query_Primary_Key': q_pk,
                     'Query': query,
                     'Error': result['error']
                 })
@@ -53,8 +55,11 @@ class ResultExporter:
                 for match in result['matches']:
                     row = {
                         'Query_Row': query_row,
+                        'Query_Primary_Key': q_pk,
                         'Query': query,
                         'Match_Rank': match['rank'],
+                        'Tag_Index': match.get('tag_index', ''),
+                        'Tag_Value': match.get('tag_value', ''),
                         'Combined_Score': round(match['combined_score'], 4)
                     }
                     
@@ -77,6 +82,7 @@ class ResultExporter:
                 # No matches found
                 rows.append({
                     'Query_Row': query_row,
+                    'Query_Primary_Key': q_pk,
                     'Query': query,
                     'Match_Rank': 0,
                     'Note': 'No matches found'
@@ -109,8 +115,11 @@ class ResultExporter:
         rows = []
         for entry in qa_data:
             row = {
+                'Query_Primary_Key': entry.get('primary_key_value') or '',
                 'Query': entry['query'],
                 'Match_Rank': entry['match_rank'],
+                'Tag_Index': entry.get('tag_index', ''),
+                'Tag_Value': entry.get('tag_value', ''),
                 'Match_Text': entry['match_text'][:200],  # Truncate
                 'QA_Status': entry['status'],  # 'accepted', 'rejected', 'edited'
                 'QA_Notes': entry.get('notes', ''),

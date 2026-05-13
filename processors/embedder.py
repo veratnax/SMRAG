@@ -7,6 +7,7 @@ from typing import List, Dict
 import numpy as np
 from config import EMBEDDING_MODEL
 import time
+import re
 
 
 class Embedder:
@@ -137,16 +138,91 @@ class Embedder:
             return [item.embedding for item in response.data]
         except Exception as e:
             err_text = str(e)
-            is_size_error = "max_tokens_per_request" in err_text or "Requested" in err_text and "max" in err_text
+            lower_err = err_text.lower()
+            is_size_error = any(token in lower_err for token in [
+                "max_tokens_per_request",
+                "maximum input length",
+                "maximum context length",
+                "invalid 'input",
+                "too many tokens",
+            ]) or ("requested" in lower_err and "max" in lower_err)
             
             if is_size_error and len(batch_texts) > 1 and depth < max_depth:
                 mid = len(batch_texts) // 2
                 left = self._embed_with_retry(batch_texts[:mid], depth + 1, max_depth)
                 right = self._embed_with_retry(batch_texts[mid:], depth + 1, max_depth)
                 return left + right
+
+            # Single oversized text fallback: split into semantic-ish chunks and
+            # ensemble the chunk embeddings into one query embedding.
+            if is_size_error and len(batch_texts) == 1 and depth < max_depth:
+                text = batch_texts[0]
+                chunked = self._split_text_for_embedding(text, max_chunks=5, target_chars=4500)
+                if len(chunked) > 1:
+                    print(
+                        f"Embedding input too long; splitting into {len(chunked)} chunks "
+                        "and ensembling embeddings."
+                    )
+                    chunk_embeddings = self._embed_with_retry(chunked, depth + 1, max_depth)
+                    valid = [np.array(e, dtype=float) for e in chunk_embeddings if e is not None]
+                    if valid:
+                        combined = np.mean(valid, axis=0)
+                        norm = np.linalg.norm(combined)
+                        if norm > 0:
+                            combined = combined / norm
+                        return [combined.tolist()]
             
             print(f"Error in embedding batch (size={len(batch_texts)}): {err_text}")
             return [None] * len(batch_texts)
+
+    @staticmethod
+    def _split_text_for_embedding(text: str, max_chunks: int = 5, target_chars: int = 4500) -> List[str]:
+        """
+        Split oversized text into 2-5 chunks, trying paragraph boundaries first.
+        Falls back to fixed-size windows if needed.
+        """
+        clean = " ".join((text or "").split())
+        if not clean:
+            return []
+        if len(clean) <= target_chars:
+            return [clean]
+
+        # First-pass: paragraph-ish split on punctuation + capitalization.
+        parts = []
+        current = []
+        current_len = 0
+        sentences = re.split(r'(?<=[\.\!\?])\s+(?=[A-Z0-9])', clean)
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
+            add_len = len(sent) + (1 if current else 0)
+            if current and current_len + add_len > target_chars:
+                parts.append(" ".join(current))
+                current = [sent]
+                current_len = len(sent)
+            else:
+                current.append(sent)
+                current_len += add_len
+        if current:
+            parts.append(" ".join(current))
+
+        # Fallback to fixed windows if sentence splitting didn't reduce enough.
+        if len(parts) == 1 and len(parts[0]) > target_chars:
+            parts = []
+            start = 0
+            step = max(1000, int(target_chars * 0.85))
+            while start < len(clean):
+                parts.append(clean[start:start + target_chars])
+                start += step
+
+        # Keep bounded chunk count by merging tail chunks.
+        if len(parts) > max_chunks:
+            merged = parts[:max_chunks - 1]
+            merged.append(" ".join(parts[max_chunks - 1:]))
+            parts = merged
+
+        return [p for p in parts if p.strip()]
     
     def cosine_similarity(self, embedding1: List[float], embedding2: List[float]) -> float:
         """

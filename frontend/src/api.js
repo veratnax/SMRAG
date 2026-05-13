@@ -1,5 +1,25 @@
 const BASE = "";
 
+function formatErrorDetail(detail) {
+  if (detail == null) return "";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object") {
+          const path = Array.isArray(item.loc) ? item.loc.join(".") : "";
+          const msg = item.msg || JSON.stringify(item);
+          return path ? `${path}: ${msg}` : msg;
+        }
+        return String(item);
+      })
+      .join("; ");
+  }
+  if (typeof detail === "object") return JSON.stringify(detail);
+  return String(detail);
+}
+
 async function request(path, opts = {}) {
   let res;
   try {
@@ -11,7 +31,7 @@ async function request(path, opts = {}) {
     let msg = res.statusText;
     try {
       const body = await res.json();
-      msg = body.detail || JSON.stringify(body);
+      msg = formatErrorDetail(body?.detail) || JSON.stringify(body);
     } catch {
       msg = await res.text().catch(() => msg);
     }
@@ -26,11 +46,19 @@ export function getConfig() {
   return request("/api/config");
 }
 
-export function createSession(apiKey) {
+export function createSession(body) {
   return request("/api/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ api_key: apiKey }),
+    body: JSON.stringify(body),
+  });
+}
+
+export function estimateCost(body) {
+  return request("/api/estimate-cost", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 

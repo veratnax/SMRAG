@@ -1,6 +1,13 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import * as api from "./api";
 import "./App.css";
+
+/** Labels for match_count_mode values returned by GET /api/config (match_count_modes). */
+const MATCH_MODE_LABELS = {
+  fixed: "Fixed (always top N)",
+  auto: "Auto-detect (0..N by confidence)",
+  tag_driven: "Tag-driven (1 best match per tag)",
+};
 
 /* ─── tiny helpers ───────────────────────────────────────────────── */
 
@@ -28,7 +35,7 @@ function Metric({ label, value }) {
 
 /* ─── File Upload ────────────────────────────────────────────────── */
 
-function FileUpload({ accept, label, onUploaded, disabled }) {
+function FileUpload({ accept, label, onUploaded, disabled, onError }) {
   const [uploading, setUploading] = useState(false);
   const [fileName, setFileName] = useState(null);
 
@@ -41,7 +48,8 @@ function FileUpload({ accept, label, onUploaded, disabled }) {
       setFileName(file.name);
       onUploaded(res.file_path, file.name);
     } catch (err) {
-      alert("Upload failed: " + err.message);
+      if (onError) onError("Upload failed", err);
+      else alert("Upload failed: " + err.message);
     } finally {
       setUploading(false);
     }
@@ -91,6 +99,9 @@ function MatchCard({ match, useCase, children }) {
           <span className="score">LLM: {match.llm_relevance_score.toFixed(3)}</span>
         )}
       </div>
+      {match.tag_value != null && match.tag_value !== "" && (
+        <div className="match-meta"><strong>Tag {match.tag_index || "?"}:</strong> {match.tag_value}</div>
+      )}
       {useCase === "pdf_kb" ? (
         <>
           <div className="match-meta">Page {match.page_number}</div>
@@ -111,13 +122,13 @@ function MatchCard({ match, useCase, children }) {
       )}
       {showReasoning && <p className="reasoning">{match.llm_reasoning}</p>}
       {children}
-    </div>
+        </div>
   );
 }
 
 /* ─── Results Browser ────────────────────────────────────────────── */
 
-function ResultsBrowser({ results, useCase, onStartQA, onExport, onReset, onReprocessAll, matchingStage, processing, learningsApplied, totalQueries }) {
+function ResultsBrowser({ results, useCase, onStartQA, onExport, onReset, onReprocessAll, matchingStage, processing, learningsApplied, totalQueries, queryJobProgress }) {
   const [expanded, setExpanded] = useState(null);
 
   const isFinal = matchingStage === "final_done";
@@ -127,7 +138,14 @@ function ResultsBrowser({ results, useCase, onStartQA, onExport, onReset, onRepr
     <section className="panel">
       <h2>Results ({results.length} queries{totalQueries > 0 && results.length < totalQueries ? ` of ${totalQueries}` : ""})</h2>
 
-      {processing && <Spinner text="Processing all queries… This runs in the background even if your screen turns off." />}
+      {processing && (
+        <Spinner
+          text={
+            formatQueryJobProgress(queryJobProgress)
+            || "Processing all queries… This runs in the background even if your screen turns off."
+          }
+        />
+      )}
 
       {isLearningsDone && !processing && (
         <div className="info-box" style={{ marginBottom: 16 }}>
@@ -168,12 +186,18 @@ function ResultsBrowser({ results, useCase, onStartQA, onExport, onReset, onRepr
           <div key={r.query_id} className="result-item">
             <button className="result-toggle" onClick={() => setExpanded(expanded === i ? null : i)}>
               <span className="result-num">Q{i + 1}</span>
-              <span className="result-query">{r.query}</span>
+              <span className="result-query">
+                {r.primary_key != null && r.primary_key !== "" && (
+                  <span className="result-pk muted" style={{ marginRight: 8 }}>[{r.primary_key}]</span>
+                )}
+                {r.query}
+              </span>
               <span className="result-count">{r.num_matches} matches</span>
               <span className="chevron">{expanded === i ? "▲" : "▼"}</span>
             </button>
             {expanded === i && (
               <div className="result-detail">
+                {r.warning && <div className="info-box" style={{ marginBottom: 10 }}>{r.warning}</div>}
                 {r.error && <div className="error-msg">{r.error}</div>}
                 {r.matches.map((m) => (
                   <MatchCard key={m.rank} match={m} useCase={useCase} />
@@ -190,7 +214,7 @@ function ResultsBrowser({ results, useCase, onStartQA, onExport, onReset, onRepr
 
 /* ─── QA Review Interface ────────────────────────────────────────── */
 
-function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSize, onDone }) {
+function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSize, onDone, onError }) {
   const qaResults = results.slice(0, Math.min(qaSampleSize, results.length));
   const [idx, setIdx] = useState(0);
   const [labels, setLabels] = useState({});
@@ -209,7 +233,7 @@ function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSi
       } else {
         onDone(action);
       }
-    }} />;
+    }} onError={onError} />;
   }
 
   const current = qaResults[idx];
@@ -226,9 +250,12 @@ function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSi
           qa_session_id: qaSessionId,
           query_id: current.query_id,
           query: current.query,
+          primary_key: current.primary_key || null,
           match_rank: match.rank,
           match_id: match.chunk_id || match.key || "",
           match_text: match.text || match.definition || "",
+          tag_index: match.tag_index ?? null,
+          tag_value: match.tag_value ?? null,
           status,
           notes: JSON.stringify({
             review_label: label,
@@ -244,7 +271,8 @@ function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSi
       setAnalystNote("");
       setIdx(idx + 1);
     } catch (err) {
-      alert("Error saving feedback: " + err.message);
+      if (onError) onError("Error saving feedback", err);
+      else alert("Error saving feedback: " + err.message);
     } finally {
       setSaving(false);
     }
@@ -260,6 +288,9 @@ function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSi
       <div className="qa-query-box">
         <label>Query</label>
         <p>{current.query}</p>
+        {current.primary_key != null && current.primary_key !== "" && (
+          <p className="muted" style={{ marginTop: 6 }}><strong>Primary key:</strong> {current.primary_key}</p>
+        )}
       </div>
 
       {current.matches.map((match) => (
@@ -299,13 +330,13 @@ function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSi
       <div className="btn-row" style={{ marginTop: 8 }}>
         <button className="btn btn-ghost" onClick={() => onDone("back")}>← Back to Results</button>
       </div>
-    </section>
+      </section>
   );
 }
 
 /* ─── QA Summary ─────────────────────────────────────────────────── */
 
-function QASummary({ sessionId, qaSessionId, onDone }) {
+function QASummary({ sessionId, qaSessionId, onDone, onError }) {
   const [analysis, setAnalysis] = useState(null);
   const [applying, setApplying] = useState(false);
   const [applyResult, setApplyResult] = useState(null);
@@ -320,7 +351,8 @@ function QASummary({ sessionId, qaSessionId, onDone }) {
       const res = await api.applyLearnings(sessionId, qaSessionId);
       setApplyResult(res.changes);
     } catch (err) {
-      alert("Error: " + err.message);
+      if (onError) onError("Error applying learnings", err);
+      else alert("Error: " + err.message);
     } finally {
       setApplying(false);
     }
@@ -382,6 +414,101 @@ function clearSession() {
   try { sessionStorage.removeItem(STORAGE_KEY); } catch { /* storage unavailable */ }
 }
 
+const TAG_SEPARATOR_OPTIONS = [
+  { label: "Comma (,)", value: "," },
+  { label: "Semicolon (;)", value: ";" },
+  { label: "Pipe (|)", value: "|" },
+  { label: "Slash (/)", value: "/" },
+  { label: "Backslash (\\)", value: "\\" },
+  { label: "Asterisk (*)", value: "*" },
+  { label: "Hash (#)", value: "#" },
+];
+
+function splitTagPreview(rawValue, sep) {
+  if (rawValue == null) return [];
+  const text = String(rawValue).trim();
+  if (!text) return [];
+  return text.split(sep).map((t) => t.trim()).filter(Boolean);
+}
+
+/** Backend job progress: { stage, done, total } */
+function formatQueryJobProgress(p) {
+  if (!p || p.total == null || p.total <= 0) return null;
+  const { stage, done, total } = p;
+  if (stage === "retrieval") return `Retrieving queries: ${done} / ${total}`;
+  if (stage === "rerank") return `Ranking matches: ${done} / ${total}`;
+  if (stage === "done") return `Complete: ${done} / ${total}`;
+  return `Processing: ${done} / ${total}`;
+}
+
+/* ─── Full-process cost confirmation (Process all queries only) ─── */
+
+function ProcessAllCostModal({ estimate, onClose, onProceed }) {
+  const n = estimate?.num_queries ?? 0;
+  const total = estimate?.total_usd ?? 0;
+  const avg = estimate?.avg_usd_per_query ?? 0;
+  const model = estimate?.llm_model ?? "—";
+  const lo = estimate?.total_usd_range?.[0];
+  const hi = estimate?.total_usd_range?.[1];
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+      <div
+        className="modal-panel cost-confirm-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="cost-modal-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 id="cost-modal-title" className="cost-modal-title">Process all queries</h3>
+        <div className="cost-modal-section">
+          <div className="cost-modal-section-head">## QUERIES ##</div>
+          <pre className="cost-modal-pre">
+            {`Queries in this run: ${n}`}
+          </pre>
+        </div>
+        <div className="cost-modal-section">
+          <div className="cost-modal-section-head">## COSTS (approx.) ##</div>
+          <pre className="cost-modal-pre">
+            {`LLM model: ${model}
+Avg. est. cost per query: $${avg.toFixed(6)}
+Estimated total: $${total.toFixed(4)}${lo != null && hi != null ? `\nTypical range: $${lo.toFixed(4)} – $${hi.toFixed(4)}` : ""}`}
+          </pre>
+          <p className="muted cost-modal-disclaimer">{estimate?.disclaimer}</p>
+        </div>
+        <p className="cost-modal-prompt">Do you want to proceed and process all queries?</p>
+        <div className="cost-modal-actions">
+          <button type="button" className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button type="button" className="btn btn-primary" onClick={onProceed}>OK</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ErrorModal({ title, message, onClose, onCopy }) {
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+      <div
+        className="modal-panel cost-confirm-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="error-modal-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 id="error-modal-title" className="cost-modal-title">{title || "Error"}</h3>
+        <div className="cost-modal-section">
+          <div className="cost-modal-section-head">## DETAILS ##</div>
+          <pre className="cost-modal-pre">{message || "Unknown error"}</pre>
+        </div>
+        <div className="cost-modal-actions">
+          <button type="button" className="btn btn-ghost" onClick={onClose}>Close</button>
+          <button type="button" className="btn btn-primary" onClick={onCopy}>Copy full error</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ─── Main App ───────────────────────────────────────────────────── */
 
 export default function App() {
@@ -390,8 +517,11 @@ export default function App() {
 
   // sidebar
   const [apiKey, setApiKey] = useState("");
+  const [anthropicKey, setAnthropicKey] = useState("");
+  const [googleKey, setGoogleKey] = useState("");
   const [useCase, setUseCase] = useState("excel");
   const [topN, setTopN] = useState(3);
+  const [matchCountMode, setMatchCountMode] = useState("fixed");
   const [useLLM, setUseLLM] = useState(true);
   const [useExpansion, setUseExpansion] = useState(true);
   const [guidance, setGuidance] = useState("");
@@ -421,9 +551,18 @@ export default function App() {
   const [queryPreview, setQueryPreview] = useState(null);
   const [queryColumns, setQueryColumns] = useState([]);
   const [queryCol, setQueryCol] = useState("");
+  const [queryPkCol, setQueryPkCol] = useState("");
+  const [queryTagCol, setQueryTagCol] = useState("");
+  const [queryTagSep, setQueryTagSep] = useState(",");
+  const [queryLlmModel, setQueryLlmModel] = useState("");
+
+  const fullProcessOptsRef = useRef(null);
+  const [fullProcessEstimate, setFullProcessEstimate] = useState(null);
+  const [errorModal, setErrorModal] = useState(null);
 
   // processing
   const [processing, setProcessing] = useState(false);
+  const [queryJobProgress, setQueryJobProgress] = useState(null);
   const [results, setResults] = useState(null);
   const [totalQueries, setTotalQueries] = useState(0);
   const [remainingOffset, setRemainingOffset] = useState(0);
@@ -442,8 +581,11 @@ export default function App() {
     saveSession({
       sessionId,
       apiKey,
+      anthropicKey,
+      googleKey,
       useCase,
       topN,
+      matchCountMode,
       useLLM,
       useExpansion,
       guidance,
@@ -452,14 +594,18 @@ export default function App() {
       kbStats,
       queryFilePath,
       queryCol,
+      queryPkCol,
+      queryTagCol,
+      queryTagSep,
+      queryLlmModel,
       matchingStage,
       totalQueries,
       remainingOffset,
       qaSessionId,
       learningsApplied,
     });
-  }, [sessionId, apiKey, useCase, topN, useLLM, useExpansion, guidance,
-      kbFilePath, kbProcessed, kbStats, queryFilePath, queryCol,
+  }, [sessionId, apiKey, anthropicKey, googleKey, useCase, topN, matchCountMode, useLLM, useExpansion, guidance,
+      kbFilePath, kbProcessed, kbStats, queryFilePath, queryCol, queryPkCol, queryTagCol, queryTagSep, queryLlmModel,
       matchingStage, totalQueries, remainingOffset, qaSessionId, learningsApplied]);
 
   // ── On mount: try restoring session from backend ──
@@ -472,8 +618,11 @@ export default function App() {
         if (!state.alive) throw new Error("dead");
 
         setApiKey(saved.apiKey || "");
+        setAnthropicKey(saved.anthropicKey || "");
+        setGoogleKey(saved.googleKey || "");
         setUseCase(saved.useCase || "excel");
         setTopN(saved.topN ?? 3);
+        setMatchCountMode(saved.matchCountMode || "fixed");
         setUseLLM(saved.useLLM ?? true);
         setUseExpansion(saved.useExpansion ?? true);
         setGuidance(saved.guidance || "");
@@ -483,6 +632,10 @@ export default function App() {
         setKbStats(saved.kbStats || null);
         setQueryFilePath(saved.queryFilePath || null);
         setQueryCol(saved.queryCol || "");
+        setQueryPkCol(saved.queryPkCol || "");
+        setQueryTagCol(saved.queryTagCol || "");
+        setQueryTagSep(saved.queryTagSep || ",");
+        setQueryLlmModel(saved.queryLlmModel || "");
         setMatchingStage(saved.matchingStage || "idle");
         setTotalQueries(saved.totalQueries || 0);
         setRemainingOffset(saved.remainingOffset || 0);
@@ -505,18 +658,47 @@ export default function App() {
 
   // load config
   useEffect(() => {
-    api.getConfig().then(setCfg).catch(() => alert("Cannot reach backend. Is it running? Run ./start.sh to start."));
+    api.getConfig().then(setCfg).catch((err) => showError(
+      "Cannot reach backend",
+      err || "Is it running? Run ./start.sh to start."
+    ));
   }, []);
+
+  useEffect(() => {
+    if (!cfg?.default_query_llm) return;
+    setQueryLlmModel((prev) => {
+      if (prev && cfg.query_llm_models?.includes(prev)) return prev;
+      return cfg.default_query_llm;
+    });
+  }, [cfg]);
+
+  const supportedMatchModes =
+    cfg?.match_count_modes?.length > 0 ? cfg.match_count_modes : ["fixed", "auto"];
+  /** Synced to state but clamped to what this API build supports (avoids 422 before useEffect runs). */
+  const effectiveMatchCountMode = supportedMatchModes.includes(matchCountMode)
+    ? matchCountMode
+    : (supportedMatchModes[0] || "fixed");
+
+  useEffect(() => {
+    if (!cfg || restoring) return;
+    const modes =
+      cfg.match_count_modes?.length > 0 ? cfg.match_count_modes : ["fixed", "auto"];
+    setMatchCountMode((prev) => (modes.includes(prev) ? prev : modes[0] || "fixed"));
+  }, [cfg, restoring]);
 
   // connect
   async function handleConnect() {
     if (!apiKey.trim()) return;
     setConnecting(true);
     try {
-      const res = await api.createSession(apiKey);
+      const res = await api.createSession({
+        api_key: apiKey.trim(),
+        anthropic_api_key: anthropicKey.trim() || null,
+        google_api_key: googleKey.trim() || null,
+      });
       setSessionId(res.session_id);
     } catch (err) {
-      alert("Connection failed: " + err.message);
+      showError("Connection failed", err);
     } finally {
       setConnecting(false);
     }
@@ -536,6 +718,10 @@ export default function App() {
 
   // Process KB (runs as background job — survives browser disconnect)
   async function handleProcessKB() {
+    if (useCase === "excel" && (!keyCol || !valCol)) {
+      showError("Missing columns", "Please select both a Key Column and a Definition Column.");
+      return;
+    }
     setKbLoading(true);
     try {
       let res;
@@ -562,7 +748,7 @@ export default function App() {
         api.getKBKeys(sessionId).then((r) => setKbKeys(r.keys)).catch(() => {});
       }
     } catch (err) {
-      alert("KB processing failed: " + err.message);
+      showError("KB processing failed", err);
     } finally {
       setKbLoading(false);
     }
@@ -571,27 +757,91 @@ export default function App() {
   // Query file uploaded → preview
   async function handleQueryUploaded(path) {
     setQueryFilePath(path);
+    setQueryPkCol("");
+    setQueryTagCol("");
+    setQueryTagSep(",");
     const prev = await api.previewExcel(path);
     setQueryPreview(prev);
     setQueryColumns(prev.columns);
     if (prev.columns.length > 0) setQueryCol(prev.columns[0]);
   }
 
+  const buildFullProcessEstimateBody = () => ({
+    session_id: sessionId,
+    file_path: queryFilePath,
+    query_column: queryCol,
+    primary_key_column: queryPkCol.trim() ? queryPkCol.trim() : null,
+    query_offset: 0,
+    query_limit: null,
+    top_n: topN,
+    match_count_mode: effectiveMatchCountMode,
+    min_llm_score: 0.70,
+    min_combined_score: 0.0,
+    relative_ratio: 0.75,
+    gap_stop_delta: 0.12,
+    tag_column: effectiveMatchCountMode === "tag_driven" ? (queryTagCol.trim() || null) : null,
+    tag_separator: effectiveMatchCountMode === "tag_driven" ? queryTagSep : null,
+    use_llm_reranking: useLLM,
+    use_query_expansion: useExpansion,
+    matching_guidance: guidance || null,
+    llm_model: queryLlmModel || cfg?.default_query_llm || "gpt-4.1-mini",
+  });
+
+  function closeFullProcessModal() {
+    fullProcessOptsRef.current = null;
+    setFullProcessEstimate(null);
+  }
+
+  function showError(title, errOrMessage) {
+    const message = typeof errOrMessage === "string"
+      ? errOrMessage
+      : (errOrMessage?.message || String(errOrMessage));
+    setErrorModal({ title, message });
+  }
+
+  function closeErrorModal() {
+    setErrorModal(null);
+  }
+
+  async function copyErrorModalText() {
+    if (!errorModal?.message) return;
+    try {
+      await navigator.clipboard.writeText(errorModal.message);
+    } catch {
+      // Clipboard may be unavailable in some environments; keep modal open.
+    }
+  }
+
   // Process queries (runs as background job — survives browser disconnect)
   async function handleProcessQueries(offset = 0, limit = null, append = false) {
     setProcessing(true);
+    setQueryJobProgress(null);
     try {
-      const res = await api.processQueries({
-        session_id: sessionId,
-        file_path: queryFilePath,
-        query_column: queryCol,
-        top_n: topN,
-        use_llm_reranking: useLLM,
-        use_query_expansion: useExpansion,
-        query_offset: offset,
-        query_limit: limit,
-        matching_guidance: guidance || null,
-      });
+      const res = await api.processQueries(
+        {
+          session_id: sessionId,
+          file_path: queryFilePath,
+          query_column: queryCol,
+          primary_key_column: queryPkCol.trim() ? queryPkCol.trim() : null,
+          top_n: topN,
+          match_count_mode: effectiveMatchCountMode,
+          min_llm_score: 0.70,
+          min_combined_score: 0.0,
+          relative_ratio: 0.75,
+          gap_stop_delta: 0.12,
+          tag_column: effectiveMatchCountMode === "tag_driven" ? (queryTagCol.trim() || null) : null,
+          tag_separator: effectiveMatchCountMode === "tag_driven" ? queryTagSep : null,
+          use_llm_reranking: useLLM,
+          use_query_expansion: useExpansion,
+          query_offset: offset,
+          query_limit: limit,
+          matching_guidance: guidance || null,
+          llm_model: queryLlmModel || cfg?.default_query_llm || "gpt-4.1-mini",
+        },
+        (job) => {
+          if (job.progress) setQueryJobProgress(job.progress);
+        },
+      );
       if (append) {
         setResults((prev) => [...(prev || []), ...res.results]);
       } else {
@@ -600,9 +850,34 @@ export default function App() {
       }
       return res;
     } catch (err) {
-      alert("Processing failed: " + err.message);
+      showError("Processing failed", err);
     } finally {
+      setQueryJobProgress(null);
       setProcessing(false);
+    }
+  }
+
+  async function handleProceedFullProcess() {
+    const opt = fullProcessOptsRef.current;
+    setFullProcessEstimate(null);
+    fullProcessOptsRef.current = null;
+    if (!opt) return;
+    if (opt.kind === "qa") setQaMode(false);
+    if (opt.kind === "qa" && opt.didApply) setLearningsApplied(true);
+    try {
+      await api.clearResults(sessionId);
+      setResults(null);
+      const res = await handleProcessQueries(0, null, false);
+      if (res) {
+        setTotalQueries(res.count);
+        if (opt.kind === "qa") {
+          setMatchingStage(opt.didApply ? "remaining_done" : "final_done");
+        } else {
+          setMatchingStage("final_done");
+        }
+      }
+    } catch (err) {
+      showError("Processing failed", err);
     }
   }
 
@@ -623,45 +898,29 @@ export default function App() {
     setQaMode(true);
   }
 
-  // QA done → process ALL queries, then show results with export
+  // QA done → estimate cost → modal → process ALL queries (no cost modal for sample-only step)
   async function handleQADone(action) {
     if (action === "back") {
       setQaMode(false);
       return;
     }
-
-    const didApply = action === "apply";
-    if (didApply) setLearningsApplied(true);
-
-    setQaMode(false);
-    setProcessing(true);
-
     try {
-      await api.clearResults(sessionId);
-      setResults(null);
-      const res = await handleProcessQueries(0, null, false);
-      if (res) {
-        setTotalQueries(res.count);
-        setMatchingStage(didApply ? "remaining_done" : "final_done");
-      }
+      const est = await api.estimateCost(buildFullProcessEstimateBody());
+      fullProcessOptsRef.current = { kind: "qa", didApply: action === "apply" };
+      setFullProcessEstimate(est);
     } catch (err) {
-      alert("Processing failed: " + err.message);
+      showError("Could not estimate cost", err);
     }
   }
 
-  // Reprocess ALL queries from scratch with final settings (after verifying learnings)
+  // Reprocess ALL — same cost confirmation as post-QA full run
   async function handleReprocessAll() {
-    setProcessing(true);
     try {
-      await api.clearResults(sessionId);
-      setResults(null);
-      const res = await handleProcessQueries(0, null, false);
-      if (res) {
-        setTotalQueries(res.count);
-        setMatchingStage("final_done");
-      }
+      const est = await api.estimateCost(buildFullProcessEstimateBody());
+      fullProcessOptsRef.current = { kind: "reprocess" };
+      setFullProcessEstimate(est);
     } catch (err) {
-      alert("Reprocessing failed: " + err.message);
+      showError("Could not estimate cost", err);
     }
   }
 
@@ -676,7 +935,7 @@ export default function App() {
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
-      alert("Export failed: " + err.message);
+      showError("Export failed", err);
     }
   }
 
@@ -684,10 +943,16 @@ export default function App() {
   function handleReset() {
     clearSession();
     setKbFilePath(null); setKbPreview(null); setKbProcessed(false); setKbStats(null);
-    setQueryFilePath(null); setQueryPreview(null); setResults(null);
+    setQueryFilePath(null); setQueryPreview(null); setQueryPkCol(""); setQueryTagCol(""); setQueryTagSep(","); setResults(null);
     setMatchingStage("idle"); setQaMode(false); setQaSessionId(null);
     setSessionId(null); setRemainingOffset(0); setTotalQueries(0);
+    setMatchCountMode("fixed");
     setLearningsApplied(false);
+    setQueryJobProgress(null);
+    setAnthropicKey("");
+    setGoogleKey("");
+    setQueryLlmModel(cfg?.default_query_llm || "");
+    closeFullProcessModal();
   }
 
   // Toggle additional columns
@@ -707,10 +972,26 @@ export default function App() {
           <input
             type="password"
             className="input"
-            placeholder="Enter your OpenAI API key"
+            placeholder="OpenAI API key (required — embeddings + GPT models)"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleConnect()}
+          />
+          <input
+            type="password"
+            className="input"
+            style={{ marginTop: 10 }}
+            placeholder="Anthropic API key (optional — for Claude)"
+            value={anthropicKey}
+            onChange={(e) => setAnthropicKey(e.target.value)}
+          />
+          <input
+            type="password"
+            className="input"
+            style={{ marginTop: 10 }}
+            placeholder="Google AI API key (optional — for Gemini)"
+            value={googleKey}
+            onChange={(e) => setGoogleKey(e.target.value)}
           />
           <div className="use-case-toggle">
             <button className={`toggle-btn ${useCase === "excel" ? "active" : ""}`} onClick={() => setUseCase("excel")}>
@@ -747,9 +1028,26 @@ export default function App() {
         </div>
 
         <div className="sidebar-section">
-          <label>Matches per query</label>
+          <label>{effectiveMatchCountMode === "auto" ? "Max matches per query" : "Matches per query"}</label>
           <input type="range" min={1} max={cfg.max_top_n} value={topN} onChange={(e) => setTopN(+e.target.value)} />
           <span className="range-value">{topN}</span>
+        </div>
+
+        <div className="sidebar-section">
+          <label>Match count mode</label>
+          <select className="input" value={effectiveMatchCountMode} onChange={(e) => setMatchCountMode(e.target.value)}>
+            {supportedMatchModes.map((mode) => (
+              <option key={mode} value={mode}>
+                {MATCH_MODE_LABELS[mode] || mode}
+              </option>
+            ))}
+          </select>
+          <span className="sidebar-hint">
+            Thresholds are applied only in auto mode. Tag-driven returns one best match for each tag.
+            {!supportedMatchModes.includes("tag_driven") && (
+              <> Tag-driven is unavailable until the API you are using is updated (it must list <code>tag_driven</code> in <code>/api/config</code>).</>
+            )}
+          </span>
         </div>
 
         <div className="sidebar-section">
@@ -772,6 +1070,16 @@ export default function App() {
           <textarea className="input" rows={3} placeholder="e.g., Prefer exact ATA chapter alignment…" value={guidance} onChange={(e) => setGuidance(e.target.value)} />
         </div>
 
+        <div className="sidebar-section">
+          <label>LLM for queries (expansion + rerank)</label>
+          <select className="input" value={queryLlmModel} onChange={(e) => setQueryLlmModel(e.target.value)}>
+            {(cfg.query_llm_models || []).map((m) => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+          </select>
+          <span className="sidebar-hint">Add Anthropic / Google keys on login if you pick Claude or Gemini.</span>
+        </div>
+
         <div className="sidebar-footer">
           <button className="btn btn-ghost full-w" onClick={handleReset}>Reset Session</button>
         </div>
@@ -789,6 +1097,7 @@ export default function App() {
             kbKeys={kbKeys}
             qaSampleSize={cfg.qa_sample_size}
             onDone={handleQADone}
+            onError={showError}
           />
         ) : results ? (
           /* ── Results ────────────────────────── */
@@ -803,6 +1112,7 @@ export default function App() {
             processing={processing}
             learningsApplied={learningsApplied}
             totalQueries={totalQueries}
+            queryJobProgress={queryJobProgress}
           />
         ) : (
           /* ── Setup + Query steps ────────────── */
@@ -815,6 +1125,7 @@ export default function App() {
                 accept={useCase === "pdf" ? ".pdf" : ".xlsx,.xls,.csv"}
                 label={useCase === "pdf" ? "Choose PDF file" : "Choose Excel / CSV file"}
                 onUploaded={handleKBUploaded}
+                onError={showError}
                 disabled={kbProcessed}
               />
 
@@ -862,7 +1173,11 @@ export default function App() {
               )}
 
               {kbFilePath && !kbProcessed && (
-                <button className="btn btn-primary" onClick={handleProcessKB} disabled={kbLoading}>
+                <button
+                  className="btn btn-primary"
+                  onClick={handleProcessKB}
+                  disabled={kbLoading || (useCase === "excel" && (!keyCol || !valCol))}
+                >
                   {kbLoading ? <Spinner text="Processing KB…" /> : "Process Knowledge Base"}
                 </button>
               )}
@@ -873,20 +1188,49 @@ export default function App() {
                   <Metric label="Embeddings" value={kbStats.embeddings_created || "—"} />
                   {kbStats.embeddings_failed > 0 && <Metric label="Failed" value={kbStats.embeddings_failed} />}
                   <StatusBadge text="KB Ready" type="success" />
-                </div>
+        </div>
               )}
-            </section>
+      </section>
 
             {/* Step 2: Query Upload */}
             {kbProcessed && (
               <section className="panel">
                 <h2>Step 2 — Upload Queries (Excel)</h2>
 
-                <FileUpload accept=".xlsx,.xls,.csv" label="Choose query file" onUploaded={handleQueryUploaded} disabled={processing} />
+                <FileUpload
+                  accept=".xlsx,.xls,.csv"
+                  label="Choose query file"
+                  onUploaded={handleQueryUploaded}
+                  onError={showError}
+                  disabled={processing}
+                />
 
                 {queryPreview && (
                   <>
                     <DataPreview rows={queryPreview.rows} columns={queryPreview.columns} />
+                    {effectiveMatchCountMode === "tag_driven" && queryTagCol && (
+                      <div className="info-box" style={{ marginBottom: 12 }}>
+                        {(() => {
+                          const row = (queryPreview.rows || []).find((r) => {
+                            const v = r?.[queryTagCol];
+                            return v != null && String(v).trim() !== "";
+                          });
+                          const raw = row?.[queryTagCol] ?? "";
+                          const parts = splitTagPreview(raw, queryTagSep);
+                          return (
+                            <>
+                              <strong>Tag split preview</strong>
+                              <p className="muted" style={{ marginTop: 6 }}>
+                                Sample value: {raw ? String(raw) : "—"}
+                              </p>
+                              <p className="muted" style={{ marginTop: 4 }}>
+                                Parsed tags ({parts.length}): {parts.length ? parts.join(" | ") : "none"}
+                              </p>
+                            </>
+                          );
+                        })()}
+                      </div>
+                    )}
                     <div className="column-selectors">
                       <div>
                         <label>Query Column</label>
@@ -894,9 +1238,47 @@ export default function App() {
                           {queryColumns.map((c) => <option key={c}>{c}</option>)}
                         </select>
                       </div>
+                      <div>
+                        <label>Primary key column (optional)</label>
+                        <select className="input" value={queryPkCol} onChange={(e) => setQueryPkCol(e.target.value)}>
+                          <option value="">— None —</option>
+                          {queryColumns.map((c) => (
+                            <option key={c} value={c}>{c}</option>
+                          ))}
+                        </select>
+                      </div>
+                      {effectiveMatchCountMode === "tag_driven" && (
+                        <div>
+                          <label>Tag column</label>
+                          <select className="input" value={queryTagCol} onChange={(e) => setQueryTagCol(e.target.value)}>
+                            <option value="">— Select tag column —</option>
+                            {queryColumns.map((c) => (
+                              <option key={c} value={c}>{c}</option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+                      {effectiveMatchCountMode === "tag_driven" && (
+                        <div>
+                          <label>Tag separator</label>
+                          <select className="input" value={queryTagSep} onChange={(e) => setQueryTagSep(e.target.value)}>
+                            {TAG_SEPARATOR_OPTIONS.map((opt) => (
+                              <option key={opt.value} value={opt.value}>{opt.label}</option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
                     </div>
-                    <button className="btn btn-primary" onClick={handleStartQA} disabled={processing || !queryCol}>
-                      {processing ? <Spinner text="Processing…" /> : `Process First ${cfg.qa_sample_size} & Start QA`}
+                    <button
+                      className="btn btn-primary"
+                      onClick={handleStartQA}
+                      disabled={processing || !queryCol || (effectiveMatchCountMode === "tag_driven" && !queryTagCol)}
+                    >
+                      {processing ? (
+                        <Spinner text={formatQueryJobProgress(queryJobProgress) || "Processing…"} />
+                      ) : (
+                        `Process First ${cfg.qa_sample_size} & Start QA`
+                      )}
                     </button>
                   </>
                 )}
@@ -905,6 +1287,22 @@ export default function App() {
           </>
         )}
       </main>
+
+      {fullProcessEstimate && (
+        <ProcessAllCostModal
+          estimate={fullProcessEstimate}
+          onClose={closeFullProcessModal}
+          onProceed={handleProceedFullProcess}
+        />
+      )}
+      {errorModal && (
+        <ErrorModal
+          title={errorModal.title}
+          message={errorModal.message}
+          onClose={closeErrorModal}
+          onCopy={copyErrorModalText}
+        />
+      )}
     </div>
   );
 }
