@@ -11,16 +11,17 @@ The Text Matching Tool is designed for two specific use cases:
 ```
 ┌────────────────────────────────────────────────────────────┐
 │                    User Interface Layer                     │
-│                   (Streamlit Web App)                       │
-│  - File Upload                                              │
-│  - Configuration                                            │
-│  - Results Display                                          │
-│  - QA Interface                                             │
+│           React SPA (Vite) — frontend/src/App.jsx           │
+│  - REST calls to FastAPI via /api (dev proxy → :8000)       │
+│  - File uploads, configuration, jobs + polling              │
+│  - Results, QA flows, Excel export downloads                 │
 └──────────────────────┬─────────────────────────────────────┘
-                       │
+                       │  HTTP JSON + multipart (/api/session,
+                       │               /api/upload, /api/job/… )
 ┌──────────────────────▼─────────────────────────────────────┐
-│                  Application Layer                          │
-│               (Matching Pipeline)                           │
+│                   API Layer                                 │
+│               FastAPI (api.py + Uvicorn)                     │
+│               In-memory sessions; background jobs           │
 │                                                             │
 │  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐      │
 │  │  PDF         │  │  Excel       │  │  Embedder   │      │
@@ -59,20 +60,29 @@ The Text Matching Tool is designed for two specific use cases:
 
 ### 1. User Interface Layer
 
-**Technology**: Streamlit
+**Technology**: React + Vite (`frontend/`)
 
 **Components**:
-- **Main App** (`app.py`): Orchestrates UI flow
-- **File Uploaders**: Handle PDF and Excel uploads
-- **Configuration Panel**: Sidebar for settings
-- **Results Display**: Show matching results
-- **QA Interface**: Interactive review system
+- **Shell & routing**: `frontend/src/App.jsx` — login, KB/query steps, results, QA, export
+- **`frontend/src/api.js`**: Fetch helpers for `/api/session`, `/api/upload`, `/api/job/{id}`, etc.
+- **Development**: Vite proxies `/api` → `http://localhost:8000`; production builds are static assets (serve behind same host or configure API base URL)
+- **Client state**: React state + optional `sessionStorage` reconnect (`/api/session-state`)
 
-**Key Features**:
-- Real-time feedback during processing
-- Progress indicators
-- Export functionality
-- Session state management
+**Key features**:
+- Progress via job polling (KB setup and query runs continue if the browser disconnects)
+- QA workflow, cost estimates before large batch runs
+- Export downloads (blob) from `/api/export/*`
+
+---
+
+### 1b. HTTP API Layer
+
+**Technology**: FastAPI (`api.py`)
+
+**Role**:
+- Validates requests, scoped uploads under `./data/sessions/<session_id>/uploads/`
+- Holds `MatchingPipeline` instances per HTTP session (in-memory; restart clears sessions)
+- Dispatches long work to threads and exposes `/api/job/{job_id}` for polling
 
 ---
 
@@ -399,15 +409,14 @@ User Reviews Match → Accept/Reject → Store in SQLite
 ## Security & Privacy
 
 **API Keys**:
-- Stored in session state (not persisted)
-- Never logged or saved to disk
-- User responsible for key security
+- Entered in the browser UI; submitted to **`POST /api/session`** only for the lifetime of that server-side session dict
+- Not written to SQLite or export files by default; lost on backend process restart (user must reconnect)
+- User responsible for key security when sharing screens or tunnels
 
 **Data Storage**:
-- Local SQLite database
-- Local ChromaDB vector store
-- Temporary file storage in ./data/
-- No cloud storage by default
+- SQLite for QA feedback (see `qa/`)
+- Local ChromaDB under `./data/` (default DB and/or per-session under `./data/sessions/<id>/chroma/` when configured)
+- Uploaded spreadsheets under `./data/sessions/<id>/uploads/`
 
 **Data Privacy**:
 - All processing happens locally
@@ -523,9 +532,9 @@ class SentenceBERTEmbedder:
 3. **Active Learning**: Use QA feedback to improve matching
 4. **Multi-modal**: Support for images in PDFs
 5. **Cloud Deployment**: Deploy on AWS/GCP/Azure
-6. **API Mode**: REST API for integration
+6. **API hardening**: Auth, quotas, HTTPS termination in front of Uvicorn
 7. **Advanced QA**: Machine learning for auto-QA
-8. **Collaborative**: Multi-user QA sessions
+8. **Collaborative**: Shared multi-analyst QA sessions
 
 ---
 
@@ -534,4 +543,6 @@ class SentenceBERTEmbedder:
 - ChromaDB: https://docs.trychroma.com/
 - OpenAI Embeddings: https://platform.openai.com/docs/guides/embeddings
 - BM25 Algorithm: https://en.wikipedia.org/wiki/Okapi_BM25
-- Streamlit: https://docs.streamlit.io/
+- React: https://react.dev/
+- Vite: https://vite.dev/
+- FastAPI: https://fastapi.tiangolo.com/

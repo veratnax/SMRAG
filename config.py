@@ -29,15 +29,25 @@ KEYWORD_WEIGHT = 0.3
 GUIDANCE_EMBEDDING_WEIGHT = 0.3
 
 # Query Expansion — only expand short/vague queries
-QUERY_EXPANSION_MAX_WORDS = 10  # queries with more words than this skip expansion
-QUERY_EXPANSION_CODE_PATTERN = r'(?i)(?:ATA\s*\d|P/?N[\s\-]?\w|[A-Z]{2,}\-\d{2,}|[A-Z]\d{3,}|\d{3,}\-\d+|MIL\-|ISO\s?\d|AS\d{4})'
+#QUERY_EXPANSION_MAX_WORDS = 10  # queries with more words than this skip expansion
+#QUERY_EXPANSION_CODE_PATTERN = r'(?i)(?:ATA\s*\d|P/?N[\s\-]?\w|[A-Z]{2,}\-\d{2,}|[A-Z]\d{3,}|\d{3,}\-\d+|MIL\-|ISO\s?\d|AS\d{4})'
 
 # QA Configuration
 QA_SAMPLE_SIZE = 50  # First N queries for QA
 
-# Vector Store Configuration
+# Vector Store Configuration (default when no session_id; per-session uses session_chroma_dir)
 VECTOR_STORE_PATH = "./data/chroma_db"
 COLLECTION_NAME = "knowledge_base"
+
+
+def session_upload_dir(session_id: str) -> str:
+    """Per-session uploads — avoids collisions when multiple users share one API host."""
+    return os.path.join("./data/sessions", session_id, "uploads")
+
+
+def session_chroma_dir(session_id: str) -> str:
+    """Per-session Chroma directory — each session has its own vector index."""
+    return os.path.join("./data/sessions", session_id, "chroma")
 
 # File Upload Configuration
 MAX_FILE_SIZE_MB = 100

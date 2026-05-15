@@ -53,6 +53,15 @@ class QAFeedbackStore:
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS qa_reviewed_queries (
+                qa_session_id TEXT NOT NULL,
+                query_id TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY (qa_session_id, query_id)
+            )
+        """)
+
         cursor.execute("PRAGMA table_info(qa_feedback)")
         existing_cols = {row[1] for row in cursor.fetchall()}
         if "primary_key_value" not in existing_cols:
@@ -64,11 +73,41 @@ class QAFeedbackStore:
 
         conn.commit()
         conn.close()
-    
+
+    def mark_query_reviewed(self, qa_session_id: str, query_id: str) -> None:
+        """Record that the analyst finished a query with Save & Next (subset export)."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO qa_reviewed_queries (qa_session_id, query_id, completed_at)
+            VALUES (?, ?, ?)
+            """,
+            (qa_session_id, query_id, now),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_reviewed_query_ids(self, qa_session_id: str) -> List[str]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT query_id FROM qa_reviewed_queries
+            WHERE qa_session_id = ?
+            ORDER BY completed_at
+            """,
+            (qa_session_id,),
+        )
+        rows = [r[0] for r in cursor.fetchall()]
+        conn.close()
+        return rows
+
     def create_session(self, session_id: str, use_case: str, total_queries: int) -> None:
         """
         Create a new QA session
-        
+
         Args:
             session_id: Unique session identifier
             use_case: Type of matching
@@ -76,17 +115,17 @@ class QAFeedbackStore:
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         now = datetime.now().isoformat()
-        
+
         cursor.execute("""
             INSERT INTO qa_sessions (session_id, use_case, total_queries, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?)
         """, (session_id, use_case, total_queries, now, now))
-        
+
         conn.commit()
         conn.close()
-    
+
     def add_feedback(self, session_id: str, query_id: str, query: str,
                     match_rank: int, match_id: str, match_text: str,
                     status: str, notes: Optional[str] = None,
@@ -95,7 +134,7 @@ class QAFeedbackStore:
                     tag_value: Optional[str] = None) -> None:
         """
         Add QA feedback for a match
-        
+
         Args:
             session_id: Session identifier
             query_id: Query identifier

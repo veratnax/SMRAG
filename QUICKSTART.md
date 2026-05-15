@@ -2,30 +2,55 @@
 
 ## Setup (5 minutes)
 
-### 1. Install Dependencies
+### 1. Install dependencies
+
+**Python** (virtual environment recommended):
 
 ```bash
-pip install streamlit pandas openpyxl pymupdf chromadb openai rank-bm25 numpy sentence-transformers
-```
-
-Or use the requirements file:
-```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Get OpenAI API Key
+**Frontend** (Node.js 18+):
+
+```bash
+cd frontend && npm install && cd ..
+```
+
+See `requirements.txt` for Python packages (pandas, openpyxl, PyMuPDF, ChromaDB, OpenAI client, FastAPI, Uvicorn, etc.).
+
+### 2. Get an OpenAI API Key
 
 1. Go to https://platform.openai.com/api-keys
 2. Create a new API key
 3. Copy and save it securely
 
-### 3. Run the Application
+Optional: enter Anthropic / Google keys on login if you use Claude / Gemini for the query LLM.
+
+### 3. Run the application
+
+From the project root:
 
 ```bash
-streamlit run app.py
+./start.sh
 ```
 
-The app will open in your browser at `http://localhost:8501`
+- **Web UI:** http://localhost:5173  
+- **API:** http://localhost:8000  
+
+Alternatively, run backend and frontend separately:
+
+```bash
+# Terminal 1 — backend
+source .venv/bin/activate
+uvicorn api:app --host 0.0.0.0 --reload --port 8000
+
+# Terminal 2 — frontend
+cd frontend && npm run dev
+```
+
+During development the React app proxies `/api/*` to the backend (`frontend/vite.config.js`).
 
 ---
 
@@ -51,18 +76,15 @@ The app will open in your browser at `http://localhost:8501`
 | Engine sputtering, loss of power   |
 ```
 
-### Step 2: In the Application
+### Step 2: In the application
 
-1. **Enter API Key** in the sidebar
-2. **Select**: "Excel Knowledge Base → Excel Queries"
-3. **Upload Knowledge Base**: Upload `failure_modes.xlsx`
-   - Select "Failure_Code" as Key Column
-   - Select "Description" as Definition Column
-4. **Click**: "Process Knowledge Base"
-5. **Upload Queries**: Upload `complaints.xlsx`
-   - Select "Complaint" as Query Column
-6. **Click**: "Start Matching"
-7. **View Results** and **Export to Excel**
+1. Open **http://localhost:5173**
+2. Enter your **OpenAI API key** (and optional keys) → **Start Session**
+3. Choose **Excel KB → Excel Queries** (sidebar)
+4. Upload the knowledge-base file → select Key / Definition columns → **Process Knowledge Base**
+5. Upload the query file → select **Query** column (and PK / tag columns if needed)
+6. Run **Process First N & Start QA**, complete QA / learnings as needed, then use **estimate & process remaining** or full-file flow when prompted
+7. **Export** results to Excel from the results view
 
 ---
 
@@ -70,7 +92,7 @@ The app will open in your browser at `http://localhost:8501`
 
 ### Step 1: Prepare Your Files
 
-**PDF Knowledge Base**: Any PDF document (e.g., maintenance manual)
+**PDF Knowledge Base:** any text-extractable PDF (e.g., maintenance manual)
 
 **Query Excel** (e.g., `questions.xlsx`):
 ```
@@ -81,93 +103,75 @@ The app will open in your browser at `http://localhost:8501`
 | What are the safety procedures?               |
 ```
 
-### Step 2: In the Application
+### Step 2: In the application
 
-1. **Enter API Key** in the sidebar
-2. **Select**: "PDF Knowledge Base → Excel Queries"
-3. **Upload PDF**: Upload your PDF file (may take 1-2 minutes for large files)
-4. **Upload Queries**: Upload `questions.xlsx`
-   - Select "Question" as Query Column
-5. **Click**: "Start Matching"
-6. **View Results** with page numbers
-7. **Export to Excel**
+1. **Start Session** with your API key(s)
+2. Choose **PDF KB → Excel Queries**
+3. Upload PDF → optional chunking options → **Process Knowledge Base**
+4. Upload queries, select columns, run sample QA / full processing, then export
 
 ---
 
 ## Tips for Best Results
 
-### For Excel Knowledge Base
-- Keep definitions concise but descriptive
-- Include relevant keywords in definitions
-- Use consistent terminology
+### Excel knowledge base
 
-### For PDF Knowledge Base
-- OCR scanned PDFs first if needed
-- Works best with well-formatted PDFs
-- Large PDFs (1000+ pages) may take 5-10 minutes to process
+- Keep definitions concise but descriptive  
+- Include relevant keywords  
+- Use consistent terminology  
 
-### Matching Parameters
-- **Start with 3 matches per query** (default)
-- **Enable LLM Re-ranking** for best accuracy (costs ~$0.001 per query)
-- **Increase matches to 5-10** if you need more options
+### PDF knowledge base
 
-### QA Review
-- Use QA mode to validate accuracy on first 50 queries
-- Accept/reject matches to build ground truth
-- Export QA feedback for analysis
+- OCR scanned PDFs first if needed  
+- Large PDFs can take several minutes  
+
+### Matching parameters
+
+- Adjust **matches per query** and **match count mode** in the sidebar  
+- **LLM re-ranking** and **query expansion** improve quality (cost estimates before large runs)  
+
+### QA review
+
+- Use the sample batch to validate before processing the whole file  
+- Apply learnings, then optionally re-score the sample or process remaining rows  
 
 ---
 
-## Cost Expectations
+## Cost expectations
 
-**For 100 queries:**
-- Against 2000-page PDF: ~$0.20
-- Against 500-row Excel: ~$0.05
-
-**Cost breakdown:**
-- Embeddings: ~$0.07 per 2000-page PDF
-- LLM re-ranking: ~$0.001 per query (optional)
+Costs depend on embeddings, expansion, rerank model, and file size—use **estimate cost** in the UI before large runs when offered.
 
 ---
 
 ## Troubleshooting
 
-### "Module not found"
+### Cannot reach backend / stuck loading
+
+- Ensure Uvicorn is on **port 8000** (`./start.sh` or `uvicorn api:app --port 8000`)
+- Inspect `logs/backend.log`
+
+### Session not found / upload failures after restart
+
+- The API keeps sessions **in memory**; restarting the server clears them → **Start Session** again and re-upload  
+
+### Module not found
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### "API key invalid"
-- Check you copied the full key
-- Ensure key has sufficient credits
-- Try creating a new key
+### Frontend issues
 
-### "Out of memory" (large PDFs)
-- Process in batches
-- Close other applications
-- Use a machine with more RAM (8GB+ recommended)
-
-### Results not accurate
-- Enable LLM re-ranking
-- Increase number of matches
-- Try rephrasing queries to be more specific
+```bash
+cd frontend && rm -rf node_modules && npm install && npm run dev
+```
 
 ---
 
-## Next Steps
+## Next steps
 
-1. ✅ Try the test script: `python test.py`
-2. ✅ Process your first real dataset
-3. ✅ Use QA mode to validate accuracy
-4. ✅ Export and analyze results
-5. ✅ Adjust weights in `config.py` if needed
-
----
-
-## Support
-
-- Read the full README.md for detailed documentation
-- Check config.py for advanced settings
-- Review code comments for implementation details
+1. Run `python test.py` for a pipeline sanity check  
+2. Process your own data through the UI  
+3. Read **ARCHITECTURE.md** for components and APIs  
 
 **Happy matching!** 🚀

@@ -9,6 +9,27 @@ const MATCH_MODE_LABELS = {
   tag_driven: "Tag-driven (1 best match per tag)",
 };
 
+/** If GET /api/config fails, still render the app so login is usable (matches backend defaults). */
+const FALLBACK_CONFIG = {
+  qa_sample_size: 50,
+  max_top_n: 10,
+  default_top_n: 3,
+  query_llm_models: [
+    "gemini-3-flash-preview",
+    "claude-3-5-haiku-20241022",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-7-sonnet-20250219",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-5.2",
+  ],
+  default_query_llm: "gpt-4.1-mini",
+  match_count_modes: ["fixed", "auto", "tag_driven"],
+};
+
 /* ─── tiny helpers ───────────────────────────────────────────────── */
 
 function StatusBadge({ text, type = "info" }) {
@@ -35,16 +56,20 @@ function Metric({ label, value }) {
 
 /* ─── File Upload ────────────────────────────────────────────────── */
 
-function FileUpload({ accept, label, onUploaded, disabled, onError }) {
+function FileUpload({ accept, label, onUploaded, disabled, onError, sessionId }) {
   const [uploading, setUploading] = useState(false);
   const [fileName, setFileName] = useState(null);
 
   async function handleChange(e) {
     const file = e.target.files[0];
     if (!file) return;
+    if (!sessionId) {
+      if (onError) onError("Not connected", "Start a session before uploading files.");
+      return;
+    }
     setUploading(true);
     try {
-      const res = await api.uploadFile(file);
+      const res = await api.uploadFile(file, sessionId);
       setFileName(file.name);
       onUploaded(res.file_path, file.name);
     } catch (err) {
@@ -58,7 +83,7 @@ function FileUpload({ accept, label, onUploaded, disabled, onError }) {
   return (
     <div className="file-upload">
       <label className="file-upload-label">
-        <input type="file" accept={accept} onChange={handleChange} disabled={disabled || uploading} />
+        <input type="file" accept={accept} onChange={handleChange} disabled={disabled || uploading || !sessionId} />
         <span className="file-upload-btn">{uploading ? "Uploading…" : label}</span>
       </label>
       {fileName && <span className="file-name">{fileName}</span>}
@@ -214,7 +239,22 @@ function ResultsBrowser({ results, useCase, onStartQA, onExport, onReset, onRepr
 
 /* ─── QA Review Interface ────────────────────────────────────────── */
 
-function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSize, onDone, onError }) {
+function QAReview({
+  results,
+  useCase,
+  sessionId,
+  qaSessionId,
+  kbKeys,
+  qaSampleSize,
+  totalQueries,
+  remainingOffset,
+  onBackToResults,
+  onSkipLearningsProcessAll,
+  onOpenRemainingCostModal,
+  onRescoreAfterLearnings,
+  onExportQAReviewed,
+  onError,
+}) {
   const qaResults = results.slice(0, Math.min(qaSampleSize, results.length));
   const [idx, setIdx] = useState(0);
   const [labels, setLabels] = useState({});
@@ -226,14 +266,24 @@ function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSi
   const [showSummary, setShowSummary] = useState(false);
 
   if (idx >= qaResults.length || showSummary) {
-    return <QASummary sessionId={sessionId} qaSessionId={qaSessionId} onDone={(action) => {
-      if (action === "back") {
-        setShowSummary(false);
-        setIdx(Math.max(0, qaResults.length - 1));
-      } else {
-        onDone(action);
-      }
-    }} onError={onError} />;
+    return (
+      <QASummary
+        sessionId={sessionId}
+        qaSessionId={qaSessionId}
+        totalQueries={totalQueries}
+        remainingOffset={remainingOffset}
+        onError={onError}
+        onBackToQAReview={() => {
+          setShowSummary(false);
+          setIdx(Math.max(0, qaResults.length - 1));
+        }}
+        onSkipLearningsProcessAll={onSkipLearningsProcessAll}
+        onRescoreAfterLearnings={onRescoreAfterLearnings}
+        onOpenRemainingCost={onOpenRemainingCostModal}
+        onBackToResults={onBackToResults}
+        onExportQAReviewed={onExportQAReviewed}
+      />
+    );
   }
 
   const current = qaResults[idx];
@@ -264,6 +314,11 @@ function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSi
             analyst_note: status === "rejected" ? analystNote : "",
           }),
         });
+      }
+      try {
+        await api.markQAQueryReviewed(qaSessionId, current.query_id);
+      } catch (e) {
+        if (onError) onError("Could not record QA review", e);
       }
       setLabels({});
       setSuggestedKey("");
@@ -328,7 +383,10 @@ function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSi
         <button className="btn btn-outline" onClick={() => setShowSummary(true)}>Finish QA Early →</button>
       </div>
       <div className="btn-row" style={{ marginTop: 8 }}>
-        <button className="btn btn-ghost" onClick={() => onDone("back")}>← Back to Results</button>
+        <button type="button" className="btn btn-secondary" onClick={onExportQAReviewed}>
+          Export QA-reviewed subset
+        </button>
+        <button className="btn btn-ghost" onClick={onBackToResults}>← Back to Results</button>
       </div>
       </section>
   );
@@ -336,10 +394,24 @@ function QAReview({ results, useCase, sessionId, qaSessionId, kbKeys, qaSampleSi
 
 /* ─── QA Summary ─────────────────────────────────────────────────── */
 
-function QASummary({ sessionId, qaSessionId, onDone, onError }) {
+function QASummary({
+  sessionId,
+  qaSessionId,
+  totalQueries,
+  remainingOffset,
+  onError,
+  onBackToQAReview,
+  onSkipLearningsProcessAll,
+  onRescoreAfterLearnings,
+  onOpenRemainingCost,
+  onBackToResults,
+  onExportQAReviewed,
+}) {
   const [analysis, setAnalysis] = useState(null);
   const [applying, setApplying] = useState(false);
   const [applyResult, setApplyResult] = useState(null);
+
+  const hasRemaining = totalQueries <= 0 || remainingOffset < totalQueries;
 
   useEffect(() => {
     api.getQAAnalysis(qaSessionId).then(setAnalysis).catch(() => { /* ignored — spinner stays */ });
@@ -371,6 +443,15 @@ function QASummary({ sessionId, qaSessionId, onDone, onError }) {
         <Metric label="Confidence" value={`${(analysis.confidence * 100).toFixed(0)}%`} />
       </div>
 
+      <div className="btn-row" style={{ marginTop: 12 }}>
+        <button type="button" className="btn btn-secondary" onClick={onExportQAReviewed}>
+          Export QA-reviewed subset
+        </button>
+      </div>
+      <p className="muted" style={{ marginTop: 6 }}>
+        Rows saved with Save &amp; Next (and marked reviewed) are merged into Excel with model columns, QA status, and suggestions.
+      </p>
+
       {analysis.suggested_weights && (
         <div className="suggestion-box">
           <h4>Suggested Weight Adjustment</h4>
@@ -382,17 +463,35 @@ function QASummary({ sessionId, qaSessionId, onDone, onError }) {
       {!applyResult ? (
         <div className="btn-row">
           <button className="btn btn-primary" onClick={handleApply} disabled={applying || analysis.total_reviews < 3}>
-            {applying ? "Applying…" : "Apply Learnings & Continue"}
+            {applying ? "Applying…" : "Apply Learnings"}
           </button>
-          <button className="btn btn-secondary" onClick={() => onDone("skip")}>Skip Learnings & Process All</button>
-          <button className="btn btn-outline" onClick={() => onDone("back")}>← Go Back to QA Review</button>
+          <button className="btn btn-secondary" onClick={onSkipLearningsProcessAll}>
+            Skip Learnings &amp; Process All
+          </button>
+          <button className="btn btn-outline" onClick={onBackToQAReview}>← Go Back to QA Review</button>
         </div>
       ) : (
         <div>
           {applyResult.weights_adjusted && <StatusBadge text="Weights adjusted" type="success" />}
           {applyResult.few_shot_enabled && <StatusBadge text={`Few-shot enabled (${applyResult.num_examples} examples)`} type="success" />}
+          <p className="muted" style={{ marginTop: 12 }}>
+            Choose how to continue: re-run the QA sample with updated settings, process the rest of the file (cost estimate), or return to the results list.
+          </p>
           <div className="btn-row" style={{ marginTop: 12 }}>
-            <button className="btn btn-primary" onClick={() => onDone("apply")}>Process Remaining Queries</button>
+            <button type="button" className="btn btn-primary" onClick={onRescoreAfterLearnings}>
+              Re-score sample &amp; QA again
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={onOpenRemainingCost}
+              disabled={!hasRemaining}
+            >
+              Process remaining (estimate cost)
+            </button>
+            <button type="button" className="btn btn-outline" onClick={onBackToResults}>
+              Back to results
+            </button>
           </div>
         </div>
       )}
@@ -441,15 +540,17 @@ function formatQueryJobProgress(p) {
   return `Processing: ${done} / ${total}`;
 }
 
-/* ─── Full-process cost confirmation (Process all queries only) ─── */
+/* ─── Full-process cost confirmation (all queries vs remaining slice) ─── */
 
-function ProcessAllCostModal({ estimate, onClose, onProceed }) {
+function ProcessAllCostModal({ estimate, title, proceedPrompt, onClose, onProceed }) {
   const n = estimate?.num_queries ?? 0;
   const total = estimate?.total_usd ?? 0;
   const avg = estimate?.avg_usd_per_query ?? 0;
   const model = estimate?.llm_model ?? "—";
   const lo = estimate?.total_usd_range?.[0];
   const hi = estimate?.total_usd_range?.[1];
+  const modalTitle = title || "Process queries";
+  const prompt = proceedPrompt || "Do you want to proceed and run matching for these queries?";
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
       <div
@@ -459,7 +560,7 @@ function ProcessAllCostModal({ estimate, onClose, onProceed }) {
         aria-labelledby="cost-modal-title"
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 id="cost-modal-title" className="cost-modal-title">Process all queries</h3>
+        <h3 id="cost-modal-title" className="cost-modal-title">{modalTitle}</h3>
         <div className="cost-modal-section">
           <div className="cost-modal-section-head">## QUERIES ##</div>
           <pre className="cost-modal-pre">
@@ -475,7 +576,7 @@ Estimated total: $${total.toFixed(4)}${lo != null && hi != null ? `\nTypical ran
           </pre>
           <p className="muted cost-modal-disclaimer">{estimate?.disclaimer}</p>
         </div>
-        <p className="cost-modal-prompt">Do you want to proceed and process all queries?</p>
+        <p className="cost-modal-prompt">{prompt}</p>
         <div className="cost-modal-actions">
           <button type="button" className="btn btn-ghost" onClick={onClose}>Cancel</button>
           <button type="button" className="btn btn-primary" onClick={onProceed}>OK</button>
@@ -558,6 +659,7 @@ export default function App() {
 
   const fullProcessOptsRef = useRef(null);
   const [fullProcessEstimate, setFullProcessEstimate] = useState(null);
+  const [fullProcessModalMeta, setFullProcessModalMeta] = useState(null);
   const [errorModal, setErrorModal] = useState(null);
 
   // processing
@@ -612,7 +714,10 @@ export default function App() {
   useEffect(() => {
     async function restore() {
       const saved = loadSession();
-      if (!saved?.sessionId) { setRestoring(false); return; }
+      if (!saved?.sessionId) {
+        setRestoring(false);
+        return;
+      }
       try {
         const state = await api.getSessionState(saved.sessionId);
         if (!state.alive) throw new Error("dead");
@@ -650,18 +755,22 @@ export default function App() {
         }
       } catch { /* session expired or backend restarted */
         clearSession();
+      } finally {
+        setRestoring(false);
       }
-      setRestoring(false);
     }
     restore();
   }, []);
 
-  // load config
+  // load config (fallback keeps UI usable if backend is down)
   useEffect(() => {
-    api.getConfig().then(setCfg).catch((err) => showError(
-      "Cannot reach backend",
-      err || "Is it running? Run ./start.sh to start."
-    ));
+    api.getConfig().then(setCfg).catch((err) => {
+      setErrorModal({
+        title: "Cannot reach backend",
+        message: typeof err?.message === "string" ? err.message : "Is it running? Run ./start.sh from the project root.",
+      });
+      setCfg(FALLBACK_CONFIG);
+    });
   }, []);
 
   useEffect(() => {
@@ -708,7 +817,7 @@ export default function App() {
   async function handleKBUploaded(path) {
     setKbFilePath(path);
     if (useCase === "excel") {
-      const prev = await api.previewExcel(path);
+      const prev = await api.previewExcel(sessionId, path);
       setKbPreview(prev);
       setKbColumns(prev.columns);
       if (prev.columns.length > 0) setKeyCol(prev.columns[0]);
@@ -760,27 +869,20 @@ export default function App() {
     setQueryPkCol("");
     setQueryTagCol("");
     setQueryTagSep(",");
-    const prev = await api.previewExcel(path);
+    const prev = await api.previewExcel(sessionId, path);
     setQueryPreview(prev);
     setQueryColumns(prev.columns);
     if (prev.columns.length > 0) setQueryCol(prev.columns[0]);
   }
 
-  const buildFullProcessEstimateBody = () => ({
+  const buildFullProcessEstimateBody = (query_offset = 0, query_limit = null) => ({
     session_id: sessionId,
     file_path: queryFilePath,
     query_column: queryCol,
     primary_key_column: queryPkCol.trim() ? queryPkCol.trim() : null,
-    query_offset: 0,
-    query_limit: null,
+    query_offset,
+    query_limit,
     top_n: topN,
-    match_count_mode: effectiveMatchCountMode,
-    min_llm_score: 0.70,
-    min_combined_score: 0.0,
-    relative_ratio: 0.75,
-    gap_stop_delta: 0.12,
-    tag_column: effectiveMatchCountMode === "tag_driven" ? (queryTagCol.trim() || null) : null,
-    tag_separator: effectiveMatchCountMode === "tag_driven" ? queryTagSep : null,
     use_llm_reranking: useLLM,
     use_query_expansion: useExpansion,
     matching_guidance: guidance || null,
@@ -790,6 +892,7 @@ export default function App() {
   function closeFullProcessModal() {
     fullProcessOptsRef.current = null;
     setFullProcessEstimate(null);
+    setFullProcessModalMeta(null);
   }
 
   function showError(title, errOrMessage) {
@@ -846,7 +949,6 @@ export default function App() {
         setResults((prev) => [...(prev || []), ...res.results]);
       } else {
         setResults(res.results);
-        setTotalQueries(res.count + (totalQueries > res.count ? totalQueries - res.count : 0));
       }
       return res;
     } catch (err) {
@@ -860,34 +962,42 @@ export default function App() {
   async function handleProceedFullProcess() {
     const opt = fullProcessOptsRef.current;
     setFullProcessEstimate(null);
+    setFullProcessModalMeta(null);
     fullProcessOptsRef.current = null;
     if (!opt) return;
-    if (opt.kind === "qa") setQaMode(false);
-    if (opt.kind === "qa" && opt.didApply) setLearningsApplied(true);
     try {
-      await api.clearResults(sessionId);
-      setResults(null);
-      const res = await handleProcessQueries(0, null, false);
-      if (res) {
-        setTotalQueries(res.count);
-        if (opt.kind === "qa") {
-          setMatchingStage(opt.didApply ? "remaining_done" : "final_done");
-        } else {
+      if (opt.processKind === "full_all") {
+        await api.clearResults(sessionId);
+        setResults(null);
+        const res = await handleProcessQueries(0, null, false);
+        if (res) {
+          setTotalQueries(res.count);
+          setRemainingOffset(res.count);
           setMatchingStage("final_done");
+          setLearningsApplied(false);
+        }
+      } else if (opt.processKind === "remaining") {
+        const res = await handleProcessQueries(remainingOffset, null, true);
+        if (res) {
+          setMatchingStage("remaining_done");
+          setLearningsApplied(true);
+          setRemainingOffset(remainingOffset + res.count);
         }
       }
+      setQaMode(false);
     } catch (err) {
       showError("Processing failed", err);
     }
   }
 
-  // Start first 50 + QA
+  // Start first N + QA
   async function handleStartQA() {
-    const prev = await api.previewExcel(queryFilePath);
+    const prev = await api.previewExcel(sessionId, queryFilePath);
     setTotalQueries(prev.total_rows);
 
     const sampleSize = cfg?.qa_sample_size || 50;
-    const res = await handleProcessQueries(0, sampleSize);
+    await api.clearResults(sessionId);
+    const res = await handleProcessQueries(0, sampleSize, false);
     if (!res) return;
 
     setRemainingOffset(res.results.length);
@@ -898,29 +1008,74 @@ export default function App() {
     setQaMode(true);
   }
 
-  // QA done → estimate cost → modal → process ALL queries (no cost modal for sample-only step)
-  async function handleQADone(action) {
-    if (action === "back") {
-      setQaMode(false);
-      return;
-    }
+  async function openFullFileCostModal(meta) {
     try {
-      const est = await api.estimateCost(buildFullProcessEstimateBody());
-      fullProcessOptsRef.current = { kind: "qa", didApply: action === "apply" };
+      const est = await api.estimateCost(buildFullProcessEstimateBody(0, null));
+      fullProcessOptsRef.current = { processKind: "full_all" };
+      setFullProcessModalMeta(meta || {
+        title: "Process all queries",
+        prompt: "Proceed with matching for every row in the query file?",
+      });
       setFullProcessEstimate(est);
     } catch (err) {
       showError("Could not estimate cost", err);
     }
   }
 
-  // Reprocess ALL — same cost confirmation as post-QA full run
   async function handleReprocessAll() {
+    await openFullFileCostModal({
+      title: "Reprocess all queries",
+      prompt: "This replaces current results and re-runs matching for every row. Proceed?",
+    });
+  }
+
+  async function handleOpenRemainingCostModal() {
+    if (totalQueries > 0 && remainingOffset >= totalQueries) {
+      showError("Nothing left to process", "All query rows have already been matched.");
+      return;
+    }
     try {
-      const est = await api.estimateCost(buildFullProcessEstimateBody());
-      fullProcessOptsRef.current = { kind: "reprocess" };
+      const est = await api.estimateCost(buildFullProcessEstimateBody(remainingOffset, null));
+      fullProcessOptsRef.current = { processKind: "remaining" };
+      const nRemain = totalQueries > 0 ? totalQueries - remainingOffset : est.num_queries;
+      setFullProcessModalMeta({
+        title: "Process remaining queries",
+        prompt: `Run matching for the next ${nRemain} row(s) (everything after your QA sample) and append to current results?`,
+      });
       setFullProcessEstimate(est);
     } catch (err) {
       showError("Could not estimate cost", err);
+    }
+  }
+
+  async function handleRescoreAfterLearnings() {
+    const sampleSize = cfg?.qa_sample_size || 50;
+    setQaMode(false);
+    try {
+      await api.clearResults(sessionId);
+      const res = await handleProcessQueries(0, sampleSize, false);
+      if (!res) return;
+      setRemainingOffset(res.results.length);
+      setMatchingStage("sample_done");
+      const qa = await api.createQASession(sessionId, useCase === "pdf" ? "pdf_kb" : "excel_kb", res.results.length);
+      setQaSessionId(qa.qa_session_id);
+      setQaMode(true);
+    } catch (err) {
+      showError("Could not re-run QA sample", err);
+    }
+  }
+
+  async function handleExportQAReviewed() {
+    try {
+      const blob = await api.exportQAReviewed(sessionId, qaSessionId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `qa_reviewed_${qaSessionId?.slice(0, 8) || "export"}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      showError("QA export failed", err);
     }
   }
 
@@ -960,7 +1115,10 @@ export default function App() {
     setAddlCols((prev) => prev.includes(col) ? prev.filter((c) => c !== col) : [...prev, col]);
   }
 
-  if (!cfg || restoring) return <div className="app-loading"><Spinner text="Connecting to backend…" /></div>;
+  if (!cfg || restoring) {
+    const loadingText = !cfg ? "Connecting to backend…" : "Restoring session…";
+    return <div className="app-loading"><Spinner text={loadingText} /></div>;
+  }
 
   /* ─── Not connected yet ──────────────────────────────────── */
   if (!sessionId) {
@@ -1096,7 +1254,16 @@ export default function App() {
             qaSessionId={qaSessionId}
             kbKeys={kbKeys}
             qaSampleSize={cfg.qa_sample_size}
-            onDone={handleQADone}
+            totalQueries={totalQueries}
+            remainingOffset={remainingOffset}
+            onBackToResults={() => setQaMode(false)}
+            onSkipLearningsProcessAll={() => openFullFileCostModal({
+              title: "Process all queries",
+              prompt: "Skip learnings and run matching for every row in the query file?",
+            })}
+            onOpenRemainingCostModal={handleOpenRemainingCostModal}
+            onRescoreAfterLearnings={handleRescoreAfterLearnings}
+            onExportQAReviewed={handleExportQAReviewed}
             onError={showError}
           />
         ) : results ? (
@@ -1124,6 +1291,7 @@ export default function App() {
               <FileUpload
                 accept={useCase === "pdf" ? ".pdf" : ".xlsx,.xls,.csv"}
                 label={useCase === "pdf" ? "Choose PDF file" : "Choose Excel / CSV file"}
+                sessionId={sessionId}
                 onUploaded={handleKBUploaded}
                 onError={showError}
                 disabled={kbProcessed}
@@ -1200,6 +1368,7 @@ export default function App() {
                 <FileUpload
                   accept=".xlsx,.xls,.csv"
                   label="Choose query file"
+                  sessionId={sessionId}
                   onUploaded={handleQueryUploaded}
                   onError={showError}
                   disabled={processing}
@@ -1291,6 +1460,8 @@ export default function App() {
       {fullProcessEstimate && (
         <ProcessAllCostModal
           estimate={fullProcessEstimate}
+          title={fullProcessModalMeta?.title}
+          proceedPrompt={fullProcessModalMeta?.prompt}
           onClose={closeFullProcessModal}
           onProceed={handleProceedFullProcess}
         />

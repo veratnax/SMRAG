@@ -32,7 +32,7 @@ from processors import ExcelProcessor
 from utils.export import ResultExporter
 from qa.feedback_store import QAFeedbackStore
 from qa.qa_learner import QALearner
-from config import QA_SAMPLE_SIZE, MAX_TOP_N, DEFAULT_TOP_N, LLM_MODEL
+from config import QA_SAMPLE_SIZE, MAX_TOP_N, DEFAULT_TOP_N, LLM_MODEL, session_upload_dir
 from utils.llm_router import validate_keys_for_model
 from utils.cost_estimate import count_queries_slice, build_cost_estimate
 from utils.llm_pricing import QUERY_LLM_MODELS
@@ -50,7 +50,8 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://127.0.0.1:8000",
     ],
-    allow_origin_regex=r"https://.*\.ngrok(-free)?\.app",
+    # ngrok Free: *.ngrok-free.dev, *.ngrok-free.app ; legacy *.ngrok.io ; paid *.ngrok.app
+    allow_origin_regex=r"https://.+\.(ngrok-free\.(app|dev)|ngrok\.io|ngrok\.app)(:\d+)?$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -69,6 +70,20 @@ def _get_session(session_id: str) -> dict:
     if session_id not in sessions:
         raise HTTPException(404, "Session not found. Create one first via /api/session.")
     return sessions[session_id]
+
+
+def _assert_session_upload_path(session_id: str, file_path: str) -> None:
+    """Ensure file_path lives under this session's upload directory (path traversal safe)."""
+    root = os.path.abspath(session_upload_dir(session_id))
+    try:
+        fp = os.path.abspath(file_path)
+    except Exception:
+        raise HTTPException(400, "Invalid file path.")
+    if fp != root and not fp.startswith(root + os.sep):
+        raise HTTPException(
+            400,
+            "File path does not belong to this session. Upload files again after starting a session.",
+        )
 
 
 def _run_job(job_id: str, fn, *args, **kwargs):
@@ -162,6 +177,11 @@ class ApplyLearningsRequest(BaseModel):
     qa_session_id: str
 
 
+class MarkQAReviewedRequest(BaseModel):
+    qa_session_id: str
+    query_id: str
+
+
 # Match-count modes this backend build supports (frontend uses this to avoid 422 vs older servers).
 MATCH_COUNT_MODES: List[str] = ["fixed", "auto", "tag_driven"]
 
@@ -203,6 +223,9 @@ def create_session(body: SessionCreate):
     sid = str(uuid.uuid4())
     anth = (body.anthropic_api_key or "").strip()
     ggl = (body.google_api_key or "").strip()
+    upload_dir = session_upload_dir(sid)
+    os.makedirs(upload_dir, exist_ok=True)
+    os.makedirs(os.path.join("./data/sessions", sid, "chroma"), exist_ok=True)
     sessions[sid] = {
         "openai_api_key": body.api_key.strip(),
         "anthropic_api_key": anth,
@@ -211,6 +234,7 @@ def create_session(body: SessionCreate):
             body.api_key.strip(),
             anthropic_api_key=anth or None,
             google_api_key=ggl or None,
+            session_id=sid,
         ),
         "results": [],
         "qa_session_id": None,
@@ -222,6 +246,7 @@ def create_session(body: SessionCreate):
 @app.post("/api/estimate-cost")
 def estimate_cost(body: EstimateCostRequest):
     sess = _get_session(body.session_id)
+    _assert_session_upload_path(body.session_id, body.file_path)
     try:
         validate_keys_for_model(
             body.llm_model,
@@ -260,7 +285,7 @@ def get_session_state(session_id: str):
     sess = sessions[session_id]
     pipeline: MatchingPipeline = sess["pipeline"]
 
-    kb_ready = getattr(pipeline, 'semantic_search', None) is not None
+    kb_ready = len(getattr(pipeline, "knowledge_base", []) or []) > 0
     results = sess.get("results", [])
     safe_results = []
     for r in results:
@@ -281,9 +306,13 @@ def get_session_state(session_id: str):
 # ── File upload ─────────────────────────────────────────────────────────────
 
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    safe_name = file.filename.replace("/", "_")
-    path = f"./data/{safe_name}"
+async def upload_file(session_id: str = Form(...), file: UploadFile = File(...)):
+    _get_session(session_id)
+    safe_name = (file.filename or "upload").replace("/", "_").replace("\\", "_")
+    uid = str(uuid.uuid4())
+    upload_dir = session_upload_dir(session_id)
+    os.makedirs(upload_dir, exist_ok=True)
+    path = os.path.join(upload_dir, f"{uid}_{safe_name}")
     contents = await file.read()
     with open(path, "wb") as f:
         f.write(contents)
@@ -293,7 +322,8 @@ async def upload_file(file: UploadFile = File(...)):
 # ── Excel preview ───────────────────────────────────────────────────────────
 
 @app.post("/api/preview")
-def preview_excel(file_path: str = Form(...)):
+def preview_excel(session_id: str = Form(...), file_path: str = Form(...)):
+    _assert_session_upload_path(session_id, file_path)
     proc = ExcelProcessor()
     proc.load_excel(file_path)
     preview = proc.preview_data(10)
@@ -340,6 +370,7 @@ def _do_setup_excel(session_id, file_path, key_column, value_column, additional_
 @app.post("/api/setup/pdf")
 def setup_pdf(body: SetupPDFRequest):
     _get_session(body.session_id)
+    _assert_session_upload_path(body.session_id, body.file_path)
     job_id = str(uuid.uuid4())
     _run_job(job_id, _do_setup_pdf,
              body.session_id, body.file_path,
@@ -350,6 +381,7 @@ def setup_pdf(body: SetupPDFRequest):
 @app.post("/api/setup/excel")
 def setup_excel(body: SetupExcelRequest):
     _get_session(body.session_id)
+    _assert_session_upload_path(body.session_id, body.file_path)
     job_id = str(uuid.uuid4())
     _run_job(job_id, _do_setup_excel,
              body.session_id, body.file_path,
@@ -412,6 +444,7 @@ def clear_results(session_id: str):
 @app.post("/api/process-queries")
 def process_queries(body: ProcessQueriesRequest):
     sess = _get_session(body.session_id)
+    _assert_session_upload_path(body.session_id, body.file_path)
     try:
         validate_keys_for_model(
             body.llm_model,
@@ -460,6 +493,13 @@ def save_feedback(body: QAFeedbackItem):
         body.status, notes=body.notes, primary_key_value=body.primary_key,
         tag_index=body.tag_index, tag_value=body.tag_value,
     )
+    return {"status": "ok"}
+
+
+@app.post("/api/qa/mark-reviewed")
+def mark_qa_reviewed(body: MarkQAReviewedRequest):
+    store = QAFeedbackStore()
+    store.mark_query_reviewed(body.qa_session_id, body.query_id)
     return {"status": "ok"}
 
 
@@ -517,5 +557,28 @@ def export_qa(qa_session_id: str = Form(...)):
     feedback = store.get_session_feedback(qa_session_id)
     exporter = ResultExporter()
     filepath = exporter.export_qa_results(feedback)
+    return FileResponse(filepath, filename=os.path.basename(filepath),
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.post("/api/export/qa-reviewed")
+def export_qa_reviewed(session_id: str = Form(...), qa_session_id: str = Form(...)):
+    sess = _get_session(session_id)
+    store = QAFeedbackStore()
+    reviewed = store.get_reviewed_query_ids(qa_session_id)
+    if not reviewed:
+        raise HTTPException(
+            400,
+            "No reviewed queries yet. Use “Save & Next” in QA to record rows for this export.",
+        )
+    feedback = store.get_session_feedback(qa_session_id)
+    use_case = sess.get("use_case", "excel_kb")
+    exporter = ResultExporter()
+    filepath = exporter.export_qa_reviewed_merge(
+        sess.get("results", []),
+        reviewed,
+        feedback,
+        use_case,
+    )
     return FileResponse(filepath, filename=os.path.basename(filepath),
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

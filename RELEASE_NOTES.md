@@ -100,7 +100,7 @@ Release Date: February 2026
 - `qa/qa_learner.py` - QA learning system
 
 ### Updated Files:
-- `app.py` - Enhanced UI with chunking options and QA learning
+- `api.py`, `frontend/` — Web UI (chunking options, QA learning) via React + FastAPI
 - `matching_pipeline.py` - Integrated intelligent chunking and QA learning
 - `matching/llm_reranker.py` - Added few-shot learning capability
 - `processors/__init__.py` - Added IntelligentChunker export
@@ -187,9 +187,9 @@ Questions or issues?
 ## Credits
 
 Built with:
-- OpenAI GPT-4 & embeddings
+- OpenAI GPT models & embeddings
 - ChromaDB (vector storage)
-- Streamlit (UI)
+- React + Vite (frontend) and FastAPI + Uvicorn (API)
 - PyMuPDF (PDF processing)
 - rank-bm25 (keyword search)
 

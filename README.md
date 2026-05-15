@@ -5,11 +5,19 @@ AI-powered text matching with intelligent chunking, QA learning, and adaptive ma
 ## Quick Start
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-streamlit run app.py
+cd frontend && npm install && cd ..
+./start.sh
 ```
 
-See QUICKSTART.md for detailed walkthrough.
+- **Frontend:** http://localhost:5173 — React (Vite)
+- **Backend API:** http://localhost:8000 — FastAPI (Uvicorn)
+
+The backend is also started with `nohup`, so it keeps running if you close the terminal; see `logs/backend.log`.
+
+See **QUICKSTART.md** for a detailed walkthrough.
 
 ## New in v2.0
 

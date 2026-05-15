@@ -25,10 +25,11 @@ A production-ready AI-powered text matching system with a web interface that sup
 
 ## Technology Stack
 
-- **Frontend**: Streamlit (web UI)
-- **Embeddings**: OpenAI text-embedding-3-large
-- **LLM**: GPT-4o (for re-ranking)
-- **Vector DB**: ChromaDB
+- **Frontend**: React 19 + Vite (SPA in `frontend/`)
+- **Backend**: FastAPI + Uvicorn (`api.py` — REST, background jobs, `/api/job/{id}` polling)
+- **Embeddings**: OpenAI text-embedding-3-large (configurable in code)
+- **LLM**: Configurable chat models for expansion + rerank (OpenAI / Anthropic / Google)
+- **Vector DB**: ChromaDB (default path; optional per-session dirs under `./data/sessions/`)
 - **Keyword Search**: BM25 (rank-bm25)
 - **PDF Processing**: PyMuPDF
 - **Data Processing**: pandas, openpyxl
@@ -36,8 +37,11 @@ A production-ready AI-powered text matching system with a web interface that sup
 ## Project Structure
 
 ```
-text_matching_tool/
-├── app.py                      # Main Streamlit app
+SMRAG/
+├── api.py                       # FastAPI app and HTTP routes
+├── start.sh                     # Start backend + frontend (dev)
+├── frontend/                   # React + Vite UI
+│   └── src/App.jsx             # Main UI
 ├── matching_pipeline.py        # Core orchestrator
 ├── config.py                   # Configuration
 ├── requirements.txt            # Dependencies
@@ -130,17 +134,19 @@ Definition: Battery insufficient voltage...
 ### 1. Install
 ```bash
 pip install -r requirements.txt
+cd frontend && npm install && cd ..
 ```
 
 ### 2. Run
 ```bash
-streamlit run app.py
+./start.sh
 ```
+Opens the UI at **http://localhost:5173** and the API at **http://localhost:8000**.
 
 ### 3. Use
-1. Enter OpenAI API key
-2. Upload files
-3. Start matching
+1. Enter API key(s) and **Start Session**
+2. Upload KB and query files (session-scoped uploads)
+3. Process KB → process sample / full queries (QA workflow as needed)
 4. Export results
 
 See **QUICKSTART.md** for detailed walkthrough.
@@ -167,16 +173,16 @@ See **QUICKSTART.md** for detailed walkthrough.
 1. **Hybrid Search**: Better than semantic-only or keyword-only
 2. **Chunking Strategy**: 500-token chunks with 50-token overlap for context
 3. **Optional LLM**: Balance between cost and accuracy
-4. **QA First 50**: Practical sample size for validation
-5. **Streamlit**: Fast prototyping, easy to use
-6. **Local Storage**: Privacy and control
+4. **QA First N**: Practical sample size for validation (configured server-side)
+5. **React + FastAPI**: Clear separation of UI and API; long jobs survive tab close (backend persists work)
+6. **Local Storage**: Privacy and control (`./data/`, SQLite QA store)
 
 ## Limitations
 
 - Sequential query processing (no parallelization yet)
 - PDF must be text-extractable (OCR not included)
 - English-optimized (works for other languages but may need tuning)
-- Single-user (no multi-user collaboration)
+- Per-connection HTTP sessions on one host (no built-in login multi-tenancy)
 - No fine-tuning (uses pre-trained models)
 
 ## Future Enhancements
@@ -185,8 +191,8 @@ See **QUICKSTART.md** for detailed walkthrough.
 2. **Active Learning**: Use QA feedback to improve matching
 3. **Fine-tuning**: Train custom embeddings on user data
 4. **Multi-modal**: Support for images in PDFs
-5. **API Mode**: REST API for integration
-6. **Collaboration**: Multi-user QA sessions
+5. **Hardening**: Auth, rate limits, and production deployment patterns on top of existing REST API
+6. **Collaboration**: Shared multi-analyst QA sessions
 7. **Advanced Analytics**: Precision/recall tracking
 8. **Caching**: Cache common queries
 
@@ -208,12 +214,13 @@ This creates sample data and tests the full pipeline.
 
 ## Files Included
 
-**Core Application**:
-- app.py (600+ lines)
-- matching_pipeline.py (200+ lines)
-- config.py (configuration)
+**Core application & frontend**:
+- `api.py` — FastAPI routes and jobs
+- `matching_pipeline.py` — orchestrator
+- `config.py` — defaults and paths
+- `frontend/` — React + Vite UI (`App.jsx`, `api.js`)
 
-**Processing Modules** (8 files):
+**Processing modules** (8 files):
 - PDF processor, Excel processor, Embedder
 - Vector store, Keyword search, Hybrid matcher, LLM reranker
 - Export utility, QA feedback store

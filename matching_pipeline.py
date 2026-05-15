@@ -9,7 +9,7 @@ from matching import KeywordSearcher, HybridMatcher, LLMReranker
 from utils.vector_store import VectorStore
 from qa.qa_learner import QALearner
 from config import (DEFAULT_TOP_N, GUIDANCE_EMBEDDING_WEIGHT, RETRIEVAL_POOL_SIZE,
-                     LLM_MODEL)
+                     LLM_MODEL, VECTOR_STORE_PATH, session_chroma_dir)
 from utils.llm_router import chat_completion, supports_openai_json_mode
 import json
 
@@ -22,6 +22,7 @@ class MatchingPipeline:
         api_key: str,
         anthropic_api_key: Optional[str] = None,
         google_api_key: Optional[str] = None,
+        session_id: Optional[str] = None,
     ):
         """
         Initialize pipeline with API keys (OpenAI required for embeddings).
@@ -30,12 +31,15 @@ class MatchingPipeline:
             api_key: OpenAI API key
             anthropic_api_key: Optional, for Claude chat models
             google_api_key: Optional, for Gemini chat models
+            session_id: When set, Chroma uses an isolated directory for this HTTP session.
         """
         self.api_key = api_key
         self._anthropic_key = anthropic_api_key or ""
         self._google_key = google_api_key or ""
+        self.session_id = session_id
         self.embedder = Embedder(api_key)
-        self.vector_store = VectorStore()
+        chroma_path = session_chroma_dir(session_id) if session_id else VECTOR_STORE_PATH
+        self.vector_store = VectorStore(persist_directory=chroma_path)
         self.keyword_searcher = KeywordSearcher()
         self.hybrid_matcher = HybridMatcher()
         self.llm_reranker = LLMReranker(api_key, anthropic_api_key, google_api_key)
